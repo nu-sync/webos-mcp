@@ -10,7 +10,7 @@ Follow [SPEC.md](SPEC.md) and the [TV session model](statechart/README.md). Targ
 
 ## Completion
 
-The five specified tools run through the real stdio MCP server; lifecycle and onboarding models match the implementation; setup and secure credential reuse work on each verified platform; screenshots are fresh, private, and honest about unsupported capture; uncertain delivery cannot cause an unsafe retry. A user-authorized TV journey demonstrates the real loop, owned resources close, and the published support matrix distinguishes tested combinations from gaps. Performance is measured without requiring a 2–3× gain.
+The six specified tools run through the real stdio MCP server; lifecycle and onboarding models match the implementation; setup and secure credential reuse work on each verified platform; screenshots are fresh, private, and honest about unsupported capture; uncertain delivery cannot cause an unsafe retry. A user-authorized TV journey demonstrates the real loop, owned resources close, and the published support matrix distinguishes tested combinations from gaps. Performance is measured without requiring a 2–3× gain.
 
 ## Unit model
 Status: pending
@@ -24,7 +24,7 @@ Evidence: pending
 Status: pending
 Depends on: model
 Write scope: Cargo manifests, Rust server entry point, MCP transport and integration tests
-Acceptance: A Rust rmcp stdio process exposes the five specified tool schemas, starts disconnected, sends diagnostics only to stderr, handles EOF, and responds with explicit not-ready errors until backends exist.
+Acceptance: A Rust rmcp stdio process exposes the six specified tool schemas, starts disconnected, sends diagnostics only to stderr, handles EOF, returns an empty metrics snapshot while disconnected, and responds with explicit not-ready errors for TV operations until backends exist.
 Verification: Run cargo fmt --check, cargo clippy, cargo test, and a real MCP client subprocess test of discovery, validation, responses, and clean shutdown; no TV interaction.
 Evidence: pending
 
@@ -41,7 +41,7 @@ Status: pending
 Depends on: onboarding
 Write scope: capture capability adapters, TV trust configuration, setup capability probe and capture tests
 Acceptance: A successful observation returns a newly captured valid image and metadata; unsupported capture is explicit. Provide a validated optional rooted SSH path with host-key verification and user-supplied authentication, and test any undocumented unrooted path before claiming support. Prevent stale images, unsafe returned URLs, and secret/image logging.
-Verification: Exercise success, stale-frame prevention, failure, URL restrictions, size bounds, identity changes, and cleanup with fake endpoints; verify the supported real TV backend only when access and a non-disruptive observation are available. Check portability of the selected SSH and credential adapters on each target OS.
+Verification: Exercise success, stale-frame prevention, complete image validation, SSH input lifetime, timeout, URL restrictions, size bounds, identity changes, and owned-file cleanup with fake endpoints; verify the supported real TV backend only when access and a non-disruptive observation are available. Check portability of the selected SSH and credential adapters on each target OS.
 Evidence: pending
 
 ## Unit session
@@ -49,15 +49,23 @@ Status: pending
 Depends on: capture
 Write scope: session owner, remote and input transport adapters, lifecycle and fault-injection tests
 Acceptance: One persistent task-scoped session enforces the checked model, serializes TV actions, rejects invalid or stale operations, invalidates observations after actions, closes only owned resources, and blocks unsafe action retries after ambiguous delivery. Input batches are bounded and paced.
-Verification: Drive the actual session API against a controllable fake transport, testing every modeled transition, failure, in-flight disconnect, late reply, timeout, reconnect and graceful shutdown; compare traces to the checked model. Verify the late-delivery gate from the model before allowing recovery; report any unresolved guarantee as a blocker.
+Verification: Drive the actual session API against a controllable fake transport, testing every modeled transition, separate control and input socket failures, tunnel port conflicts, in-flight disconnect, late reply, timeout, reconnect and graceful shutdown; compare traces to the checked model. Verify the late-delivery gate from the model before allowing recovery; report any unresolved guarantee as a blocker.
+Evidence: pending
+
+## Unit metrics
+Status: pending
+Depends on: session
+Write scope: in-memory metrics, stage timers, telemetry settings and fake-transport tests
+Acceptance: Bounded aggregate-only metrics count and time completed operations and fixed stages, include disjoint outcomes and cancellation, and expose no private content; disabling collection leaves session behavior unchanged. Snapshots never perform TV I/O or include incomplete operations.
+Verification: Inject known delays, failures, timeouts, cancellation and skipped stages into a fake transport; verify timing bounds, exact counts, privacy allowlists and snapshots during in-flight calls. Compare enabled and disabled behavior and measure overhead without claiming an unmeasured threshold.
 Evidence: pending
 
 ## Unit integration
 Status: pending
-Depends on: session
+Depends on: metrics
 Write scope: MCP tool handlers, end-to-end fake-device tests, and setup/help documentation
-Acceptance: The real compiled stdio server implements connect, observe, press, launch, and disconnect with typed schemas, native image results, explicit busy and uncertain errors, and no secrets in logs. MCP server and TV session lifetimes remain separate.
-Verification: Launch the compiled server with an MCP client against a fake device; verify image MIME and bytes, results and error semantics, multiple calls reusing connections, EOF shutdown, and visible resource cleanup. Validate the client actually displays returned images when that client is available.
+Acceptance: The real compiled stdio server implements connect, observe, press, launch, disconnect, and read-only metrics with typed schemas, native image results, explicit busy and uncertain errors, and no secrets in logs. MCP server and TV session lifetimes remain separate.
+Verification: Launch the compiled server with an MCP client against a fake device; verify image MIME and bytes, results and error semantics, multiple calls reusing connections, metrics available while disconnected, EOF shutdown, and visible resource cleanup. Validate the client actually displays returned images when that client is available.
 Evidence: pending
 
 ## Unit validation
