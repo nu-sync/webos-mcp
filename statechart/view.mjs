@@ -1,0 +1,5 @@
+export const title = 'TV control session';
+const labels = {disconnected:'TV disconnected', connecting:'Connecting to TV', needs_observation:'Fresh view needed', observing:'Capturing screen', ready:'Ready with fresh view', acting:'Sending action', uncertain:'Action delivery uncertain', closing:'Closing TV session', shutdown_closing:'Stopping and closing TV session', stopped:'MCP server stopped'};
+export const state = v => labels[v.phase];
+const steps = {Connect:'Connect requested', Connected:'TV connection ready', ConnectFailed:'Connection failed', Observe:'Request screenshot', ObserveSuccess:'Fresh screenshot received', ObserveFailure:'Screenshot failed', Act:'Send action', ActionAcknowledged:'Action acknowledged', ActionTimeout:'Action delivery uncertain', Disconnect:'Disconnect requested', Closed:'Connections closed', Shutdown:'MCP server stops', ShutdownClosed:'Connections closed', Stop:'MCP server stops', Done:'Remain stopped'};
+export const step = action => steps[action] ?? action;

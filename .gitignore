@@ -1,0 +1,8 @@
+/target/
+/.local/
+/.env
+/.env.*
+!.env.example
+*.log
+statechart/tlc.out
+statechart/tlc-*.out

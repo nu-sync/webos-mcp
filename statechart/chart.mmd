@@ -1,0 +1,42 @@
+---
+title: "TV control session"
+---
+stateDiagram-v2
+  s0: TV disconnected
+  s1: Connecting to TV
+  s2: MCP server stopped
+  s3: Closing TV session
+  s4: Fresh view needed
+  s5: Stopping and closing TV session
+  s6: Capturing screen
+  s7: Ready with fresh view
+  s8: Sending action
+  s9: Action delivery uncertain
+  [*] --> s0
+  s0 --> s1: Connect requested
+  s0 --> s2: MCP server stops
+  s1 --> s0: Connection failed
+  s1 --> s3: Disconnect requested
+  s1 --> s4: TV connection ready
+  s1 --> s5: MCP server stops
+  s3 --> s0: Connections closed
+  s3 --> s5: MCP server stops
+  s4 --> s3: Disconnect requested
+  s4 --> s5: MCP server stops
+  s4 --> s6: Request screenshot
+  s5 --> s2: Connections closed
+  s6 --> s3: Disconnect requested
+  s6 --> s5: MCP server stops
+  s6 --> s4: Screenshot failed
+  s6 --> s7: Fresh screenshot received
+  s7 --> s3: Disconnect requested
+  s7 --> s5: MCP server stops
+  s7 --> s6: Request screenshot
+  s7 --> s8: Send action
+  s8 --> s3: Disconnect requested
+  s8 --> s4: Action acknowledged
+  s8 --> s5: MCP server stops
+  s8 --> s9: Action delivery uncertain
+  s9 --> s3: Disconnect requested
+  s9 --> s5: MCP server stops
+  s9 --> s6: Request screenshot
