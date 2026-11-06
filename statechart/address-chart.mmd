@@ -1,0 +1,24 @@
+---
+title: "Private TV address setup"
+---
+stateDiagram-v2
+  s0: No address saved
+  s1: Enter TV address
+  s2: Verifying the TV
+  s3: Saving securely
+  s4: Address saved
+  s5: Secure store unavailable
+  [*] --> s0
+  s0 --> s1: Enter or change address
+  s1 --> s0: Setup interrupted
+  s1 --> s2: Submit address
+  s2 --> s0: Setup interrupted or Identity rejected
+  s2 --> s3: TV identity verified
+  s3 --> s0: Setup interrupted
+  s3 --> s4: Secure save succeeds or Setup interrupted
+  s3 --> s5: Secure save fails or Secure save could not be verified
+  s4 --> s0: Forget saved address
+  s4 --> s1: Enter or change address
+  s5 --> s1: Enter or change address
+  s1 --> s4: Setup interrupted
+  s2 --> s4: Setup interrupted or Identity rejected

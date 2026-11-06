@@ -6,3 +6,7 @@
 *.log
 statechart/tlc.out
 statechart/tlc-*.out
+
+# Do not publish local credential files.
+credentials.json
+credential-storage

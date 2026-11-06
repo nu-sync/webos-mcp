@@ -1,0 +1,34 @@
+---
+title: "TV onboarding"
+---
+stateDiagram-v2
+  s0: Setup not active
+  s1: Confirm TV identity
+  s2: Await TV pairing
+  s3: Save pairing securely
+  s4: Check visual capability
+  s5: Connected without visual capture
+  s6: Ready for visual control
+  s7: Pairing needs repair
+  s8: Check saved pairing
+  [*] --> s0
+  s0 --> s1: Start setup
+  s1 --> s0: Setup interrupted or Identity rejected
+  s1 --> s2: Identity verified
+  s2 --> s0: Setup interrupted or Pairing rejected
+  s2 --> s3: Pairing approved
+  s3 --> s0: Setup interrupted or Secure store unavailable
+  s3 --> s4: Credential saved
+  s4 --> s5: Capture unavailable
+  s4 --> s0: Setup interrupted
+  s4 --> s6: Capture supported
+  s5 --> s0: Remove local device
+  s5 --> s7: Pairing revoked
+  s6 --> s0: Remove local device
+  s6 --> s7: Pairing revoked
+  s7 --> s0: Remove local device
+  s7 --> s1: Start setup
+  s1 --> s8: Identity verified
+  s8 --> s4: Saved pairing accepted
+  s8 --> s0: Setup interrupted
+  s8 --> s7: Saved pairing rejected

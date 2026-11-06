@@ -1,7 +1,8 @@
 # TvSession
 
-TLC reached 11 states and 31 steps. The chart draws 10 states and 27 arrows.
-The chart does not draw 1 steps that stay in one chart state.
+TLC reached 37 states and 142 steps. The chart draws 13 states and 29 arrows.
+The chart does not draw 13 steps that stay in one chart state.
+The view hides 57 steps, so the chart does not draw them.
 
 ## Rules that hold
-TypeOK, ReadyHasFreshImage, UncertaintyIsVisible, NoOldImageAfterFailure, ActionRequiresObservation, StoppedIsClean, NoDeadlock
+TypeOK, CrashKeepsUncertainty, ReadyHasFreshImage, NoPendingMarkerBeforeSend, NoActionWhileUnresolved, UncertaintyIsVisible, NoOldImageAfterFailure, StoppedIsClean, NoDeadlock

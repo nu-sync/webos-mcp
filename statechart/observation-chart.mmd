@@ -1,0 +1,39 @@
+---
+title: "Observe, act once, and recover"
+---
+stateDiagram-v2
+  s0: New observation needed
+  s1: Capturing screen
+  s2: Closing connections
+  s3: Capture unavailable
+  s4: Cleanup unconfirmed
+  s5: Disconnected#59; cleanup confirmed
+  s6: Current observation available
+  s7: Checking observation identity
+  s8: Recovering capture
+  s9: Sending action once
+  s10: Action delivery unresolved
+  [*] --> s0
+  s0 --> s1: Request observation
+  s1 --> s3: Capture failed#59; action is not repeated
+  s1 --> s6: New frame returned#59; UI settling unknown
+  s2 --> s4: Cleanup fails or is interrupted
+  s2 --> s5: Connection cleanup confirmed
+  s3 --> s2: Disconnect or cancellation
+  s3 --> s8: Retry observation only
+  s4 --> s2: Retry owned cleanup
+  s5 --> s0: Reconnect with a new observation generation
+  s6 --> s1: Request observation
+  s6 --> s7: Submit action with observation identity
+  s6 --> s2: Disconnect or cancellation
+  s7 --> s9: Send using matching observation
+  s8 --> s0: Capture connection restored
+  s8 --> s3: Capture recovery failed
+  s9 --> s1: Send completes#59; capture result
+  s9 --> s10: Delivery uncertain
+  s7 --> s6: Reject stale observation#59; no send
+  s10 --> s2: Disconnect or cancellation
+  s10 --> s1: Request observation
+  s1 --> s10: New frame returned#59; UI settling unknown
+  s5 --> s10: Reconnect with a new observation generation
+  s8 --> s10: Capture connection restored

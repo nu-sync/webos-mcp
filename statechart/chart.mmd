@@ -9,34 +9,39 @@ stateDiagram-v2
   s4: Fresh view needed
   s5: Stopping and closing TV session
   s6: Capturing screen
-  s7: Ready with fresh view
-  s8: Sending action
-  s9: Action delivery uncertain
+  s7: TV connection stale
+  s8: Ready with fresh view
+  s9: Checking TV connection
+  s10: Sending action
+  s11: Action delivery unresolved
+  s12: Inspecting unresolved action
   [*] --> s0
   s0 --> s1: Connect requested
   s0 --> s2: MCP server stops
   s1 --> s0: Connection failed
-  s1 --> s3: Disconnect requested
   s1 --> s4: TV connection ready
-  s1 --> s5: MCP server stops
   s3 --> s0: Connections closed
   s3 --> s5: MCP server stops
   s4 --> s3: Disconnect requested
-  s4 --> s5: MCP server stops
   s4 --> s6: Request screenshot
+  s4 --> s7: Keepalive fails
   s5 --> s2: Connections closed
-  s6 --> s3: Disconnect requested
-  s6 --> s5: MCP server stops
   s6 --> s4: Screenshot failed
-  s6 --> s7: Fresh screenshot received
+  s6 --> s8: Fresh screenshot received
   s7 --> s3: Disconnect requested
-  s7 --> s5: MCP server stops
-  s7 --> s6: Request screenshot
-  s7 --> s8: Send action
   s8 --> s3: Disconnect requested
-  s8 --> s4: Action acknowledged
-  s8 --> s5: MCP server stops
-  s8 --> s9: Action delivery uncertain
-  s9 --> s3: Disconnect requested
-  s9 --> s5: MCP server stops
-  s9 --> s6: Request screenshot
+  s8 --> s6: Request screenshot
+  s8 --> s7: Keepalive fails
+  s8 --> s9: Check connection before action
+  s9 --> s4: Connection check failed
+  s9 --> s10: Send action
+  s10 --> s4: Send completes [TV receipt unconfirmed]
+  s10 --> s3: Disconnect requested
+  s10 --> s0: Server stops unexpectedly
+  s10 --> s11: Action timed out
+  s11 --> s4: Delivery resolved by trusted evidence [not implemented]
+  s11 --> s3: Disconnect requested
+  s11 --> s0: Server stops unexpectedly
+  s11 --> s12: Inspect screen
+  s1 --> s11: TV connection ready
+  s12 --> s11: Delivery still unresolved
