@@ -22,6 +22,8 @@ Run `webos-mcp setup --re-pair` to request a new TV authorization and `webos-mcp
 
 Build the server with `cargo build --release` and configure the MCP client to launch the resulting `target/release/webos-mcp` binary (`webos-mcp.exe` on Windows) with no arguments. The optimized build substantially reduced local PNG validation time in the tested loop; capture/transfer remained the largest measured stage.
 
+By default the TV captures JPEG for speed; the server validates it and returns a PNG containing the decoded, lossy pixels. To capture losslessly, set `WEBOS_MCP_LOSSLESS=1` in the MCP server's environment before starting it. If the TV explicitly rejects JPEG as an unsupported format, the server falls back to native PNG. A screenshot may still omit protected video or external inputs.
+
 Start the server without arguments from an MCP client using stdio. Keep one server process and TV session open while navigating:
 
 1. Call `tv_connect`, then `tv_observe`.

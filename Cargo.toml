@@ -24,6 +24,7 @@ url = "2"
 fs2 = "0.4"
 directories = "6"
 tempfile = "3"
+image = { version = "0.25.10", default-features = false, features = ["jpeg"] }
 
 [dev-dependencies]
 rcgen = "0.14"

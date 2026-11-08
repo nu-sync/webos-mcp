@@ -9,10 +9,22 @@ use std::{future::Future, io::Cursor, net::SocketAddr, sync::Arc, time::Duration
 
 const MAX_PNG: usize = 16 * 1024 * 1024;
 const MAX_DECODED: usize = 64 * 1024 * 1024;
-const CAPTURE: &str = r#"umask 077
+const CAPTURE_PNG: &str = r#"umask 077
  d=$(mktemp -d /tmp/webos-mcp.XXXXXX) || exit 1
  trap 'rm -rf "$d"' EXIT HUP INT TERM
  luna-send -w 5000 -n 1 -f luna://com.webos.surfacemanager/captureCompositorOutput "{\"output\":\"$d/screen.png\",\"format\":\"PNG\"}" > "$d/response" || exit 1
+ grep -Eq '"returnValue"[[:space:]]*:[[:space:]]*true' "$d/response" || exit 1
+ test -s "$d/screen.png" || exit 1
+ cat "$d/screen.png" || exit 1
+ rm -rf "$d" || exit 1
+ trap - EXIT HUP INT TERM"#;
+const CAPTURE: &str = r#"umask 077
+ d=$(mktemp -d /tmp/webos-mcp.XXXXXX) || exit 1
+ trap 'rm -rf "$d"' EXIT HUP INT TERM
+ luna-send -w 5000 -n 1 -f luna://com.webos.surfacemanager/captureCompositorOutput "{\"output\":\"$d/screen.png\",\"format\":\"JPG\"}" > "$d/response" || exit 1
+ if grep -q 'ERR_INVALID_FORMAT' "$d/response"; then
+   luna-send -w 5000 -n 1 -f luna://com.webos.surfacemanager/captureCompositorOutput "{\"output\":\"$d/screen.png\",\"format\":\"PNG\"}" > "$d/response" || exit 1
+ fi
  grep -Eq '"returnValue"[[:space:]]*:[[:space:]]*true' "$d/response" || exit 1
  test -s "$d/screen.png" || exit 1
  cat "$d/screen.png" || exit 1
@@ -207,8 +219,15 @@ impl CaptureSession {
                 .channel_open_session()
                 .await
                 .map_err(|_| CaptureError::ChannelOpen)?;
+            let command = if std::env::var_os("WEBOS_MCP_LOSSLESS").as_deref()
+                == Some(std::ffi::OsStr::new("1"))
+            {
+                CAPTURE_PNG
+            } else {
+                CAPTURE
+            };
             channel
-                .exec(true, CAPTURE)
+                .exec(true, command)
                 .await
                 .map_err(|_| CaptureError::Request)?;
             Ok(channel)
@@ -302,6 +321,9 @@ where
         .map_err(|_| "SSH cleanup could not be confirmed")?
 }
 fn decode_image(bytes: Vec<u8>) -> Result<CapturedImage, CaptureError> {
+    if bytes.starts_with(&[0xff, 0xd8]) {
+        return decode_jpeg(bytes);
+    }
     let mut decoder = png::Decoder::new(Cursor::new(&bytes));
     decoder.set_transformations(png::Transformations::EXPAND);
     let mut reader = decoder
@@ -357,6 +379,44 @@ fn decode_image(bytes: Vec<u8>) -> Result<CapturedImage, CaptureError> {
         height: frame.height,
         recovered: false,
     })
+}
+
+fn decode_jpeg(bytes: Vec<u8>) -> Result<CapturedImage, CaptureError> {
+    use image::ImageDecoder;
+
+    if !bytes.ends_with(&[0xff, 0xd9]) {
+        return Err(CaptureError::InvalidImage);
+    }
+    let decoder = image::codecs::jpeg::JpegDecoder::new(Cursor::new(bytes))
+        .map_err(|_| CaptureError::InvalidImage)?;
+    let (width, height) = decoder.dimensions();
+    let size = usize::try_from(decoder.total_bytes()).map_err(|_| CaptureError::DecodedLimit)?;
+    if size > MAX_DECODED {
+        return Err(CaptureError::DecodedLimit);
+    }
+    let color = match decoder.color_type() {
+        image::ColorType::L8 => png::ColorType::Grayscale,
+        image::ColorType::Rgb8 => png::ColorType::Rgb,
+        _ => return Err(CaptureError::InvalidImage),
+    };
+    let mut pixels = vec![0; size];
+    decoder
+        .read_image(&mut pixels)
+        .map_err(|_| CaptureError::InvalidImage)?;
+    let mut png = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut png, width, height);
+        encoder.set_color(color);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder
+            .write_header()
+            .map_err(|_| CaptureError::InvalidImage)?;
+        writer
+            .write_image_data(&pixels)
+            .map_err(|_| CaptureError::InvalidImage)?;
+        writer.finish().map_err(|_| CaptureError::InvalidImage)?;
+    }
+    decode_image(png)
 }
 
 trait CaptureConnection: Sized {

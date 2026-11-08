@@ -337,6 +337,21 @@ fn validates_full_png_and_preserves_low_bits_of_sixteen_bit_color() {
 }
 
 #[test]
+fn jpeg_capture_is_validated_and_returned_as_png() {
+    let mut jpeg = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new(&mut jpeg)
+        .encode(&[255, 0, 0], 1, 1, image::ExtendedColorType::Rgb8)
+        .unwrap();
+    let frame = decode_image(jpeg.clone()).unwrap();
+    assert_eq!((frame.width, frame.height, frame.all_black), (1, 1, false));
+    assert!(frame.png.starts_with(b"\x89PNG\r\n\x1a\n"));
+    assert!(matches!(
+        decode_image(jpeg[..jpeg.len() - 2].to_vec()),
+        Err(CaptureError::InvalidImage)
+    ));
+}
+
+#[test]
 fn fingerprints_pixels_and_dimensions_not_png_metadata() {
     let plain = png(1, 1, png::ColorType::Rgb, png::BitDepth::Eight, &[1, 2, 3]);
     let mut metadata = Vec::new();

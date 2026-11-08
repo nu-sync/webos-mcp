@@ -1,5 +1,11 @@
 # Verification status
 
+## Faster capture — November 8, 2026
+
+On the configured rooted TV and macOS, five alternating captures of the same Home screen per optimized binary returned full-resolution PNGs through the MCP. The native-PNG baseline median was 1.64 seconds (1.60–1.67 seconds); JPEG capture decoded and encoded as PNG on the host had a 0.28-second median (0.27–0.28 seconds). These are MCP observation timings after connecting, excluding model reasoning; clients connected and disconnected between samples. The capture images were visually inspected, and all ten calls succeeded. On the TV, five native-PNG captures took 1.39–1.49 seconds versus 0.10–0.11 seconds for JPEG, establishing compositor image generation as the main difference for this screen. Results will vary with screen content and device. JPEG is lossy; `WEBOS_MCP_LOSSLESS=1` requests native PNG instead.
+
+The optimized server also connected and captured with the lossless setting, and an actual Home, Left, Right journey returned fresh images and a confirmed disconnect. The returned images showed the focus move and return, though the wallpaper had not yet loaded. JPEG support and fallback behavior on other TVs have not been tested.
+
 ## Reliability increment — November 6, 2026
 
 The combined MCP action/observation API, required observation IDs, bounded pixel-change sampling, typed capture recovery, retained cleanup state, and local aggregate metrics are implemented. Current automated validation passes 71 tests: 27 library tests, 35 binary/session tests, five local pinned-transport tests, and four compiled-server MCP tests. `cargo fmt --check` and strict all-target Clippy pass. Optional credential-store and TV tests remain excluded from the default suite.
