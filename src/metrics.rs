@@ -34,6 +34,9 @@ impl Operation {
             Self::Connect => &[
                 Stage::CredentialLookup,
                 Stage::ConnectionSetup,
+                Stage::TcpConnect,
+                Stage::TlsHandshake,
+                Stage::WebsocketHandshake,
                 Stage::Registration,
             ],
             Self::Observe => &[
@@ -62,6 +65,9 @@ impl Operation {
 pub enum Stage {
     CredentialLookup,
     ConnectionSetup,
+    TcpConnect,
+    TlsHandshake,
+    WebsocketHandshake,
     Registration,
     CaptureRequest,
     ImageTransfer,

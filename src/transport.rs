@@ -1,6 +1,7 @@
 //! An explicitly pinned TLS connection to one configured endpoint.
 
 use std::{net::SocketAddr, sync::Arc, time::Duration};
+use tokio::time::Instant;
 
 use futures_util::{SinkExt, StreamExt};
 use rustls::{
@@ -17,6 +18,7 @@ use tokio_tungstenite::{
     tungstenite::{Message, protocol::WebSocketConfig},
 };
 
+use crate::metrics::{Metrics, Operation, Outcome, Stage};
 use crate::pairing::{Registration, parse_registration, registration_request};
 
 struct PinnedCertificate {
@@ -71,19 +73,45 @@ impl ServerCertVerifier for PinnedCertificate {
     }
 }
 
+const CONNECT_BUDGET: Duration = Duration::from_secs(10);
+
 /// Connect to exactly one endpoint using a fingerprint verified independently by the user.
 /// No registration credential is sent by this function.
 pub async fn connect(
     endpoint: SocketAddr,
     fingerprint: [u8; 32],
+    metrics: &Metrics,
 ) -> Result<AuthenticatedSocket, &'static str> {
-    connect_path(endpoint, fingerprint, "/").await
+    connect_path(endpoint, fingerprint, "/", metrics, CONNECT_BUDGET).await
 }
 
+async fn step<T>(
+    metrics: &Metrics,
+    stage: Stage,
+    deadline: Instant,
+    timed_out: &'static str,
+    work: impl Future<Output = Result<T, &'static str>>,
+) -> Result<T, &'static str> {
+    let measurement = metrics.stage(Operation::Connect, stage);
+    let result = tokio::time::timeout_at(deadline, work)
+        .await
+        .unwrap_or(Err(timed_out));
+    measurement.finish(match &result {
+        Ok(_) => Outcome::Success,
+        Err(error) if *error == timed_out => Outcome::Timeout,
+        Err(_) => Outcome::Failure,
+    });
+    result
+}
+
+/// Each step shares one overall budget; a timeout names the step that stalled.
+/// Nothing is sent to the TV before all three steps succeed.
 async fn connect_path(
     endpoint: SocketAddr,
     fingerprint: [u8; 32],
     path: &str,
+    metrics: &Metrics,
+    budget: Duration,
 ) -> Result<AuthenticatedSocket, &'static str> {
     let provider = rustls::crypto::ring::default_provider();
     let verifier = PinnedCertificate {
@@ -96,28 +124,50 @@ async fn connect_path(
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(verifier))
         .with_no_client_auth();
-    let connect = async {
-        let tcp = TcpStream::connect(endpoint)
-            .await
-            .map_err(|_| "Could not connect to the TV endpoint")?;
-        let name =
-            ServerName::try_from("webos-tv.invalid").map_err(|_| "TLS configuration failed")?;
-        let tls = TlsConnector::from(Arc::new(config))
-            .connect(name, tcp)
-            .await
-            .map_err(|_| "TV TLS authentication failed")?;
-        let limits = WebSocketConfig::default()
-            .max_message_size(Some(32 * 1024))
-            .max_frame_size(Some(32 * 1024));
-        let uri = format!("wss://webos-tv.invalid{path}");
-        let (socket, _) = client_async_with_config(uri, tls, Some(limits))
-            .await
-            .map_err(|_| "TV websocket handshake failed")?;
-        Ok(AuthenticatedSocket(socket, 0))
-    };
-    tokio::time::timeout(Duration::from_secs(10), connect)
-        .await
-        .map_err(|_| "TV connection timed out")?
+    let name = ServerName::try_from("webos-tv.invalid").map_err(|_| "TLS configuration failed")?;
+    let deadline = Instant::now() + budget;
+    let tcp = step(
+        metrics,
+        Stage::TcpConnect,
+        deadline,
+        "TV connection timed out before the TV accepted it; nothing was sent",
+        async {
+            TcpStream::connect(endpoint)
+                .await
+                .map_err(|_| "Could not connect to the TV endpoint; nothing was sent")
+        },
+    )
+    .await?;
+    let tls = step(
+        metrics,
+        Stage::TlsHandshake,
+        deadline,
+        "TV connection timed out during the TLS handshake; nothing was sent",
+        async {
+            TlsConnector::from(Arc::new(config))
+                .connect(name, tcp)
+                .await
+                .map_err(|_| "TV TLS authentication failed")
+        },
+    )
+    .await?;
+    let limits = WebSocketConfig::default()
+        .max_message_size(Some(32 * 1024))
+        .max_frame_size(Some(32 * 1024));
+    let uri = format!("wss://webos-tv.invalid{path}");
+    let (socket, _) = step(
+        metrics,
+        Stage::WebsocketHandshake,
+        deadline,
+        "TV connection timed out during the websocket handshake; nothing was sent",
+        async {
+            client_async_with_config(uri, tls, Some(limits))
+                .await
+                .map_err(|_| "TV websocket handshake failed; nothing was sent")
+        },
+    )
+    .await?;
+    Ok(AuthenticatedSocket(socket, 0))
 }
 
 impl AuthenticatedSocket {
@@ -212,6 +262,7 @@ impl AuthenticatedSocket {
         &mut self,
         endpoint: SocketAddr,
         fingerprint: [u8; 32],
+        metrics: &Metrics,
     ) -> Result<AuthenticatedSocket, &'static str> {
         let response = self
             .request(
@@ -241,7 +292,7 @@ impl AuthenticatedSocket {
             path.push('?');
             path.push_str(query);
         }
-        connect_path(endpoint, fingerprint, &path).await
+        connect_path(endpoint, fingerprint, &path, metrics, CONNECT_BUDGET).await
     }
 
     pub async fn send_button(&mut self, name: &str) -> Result<(), &'static str> {
@@ -302,4 +353,86 @@ pub async fn register(
     tokio::time::timeout(Duration::from_secs(60), exchange)
         .await
         .map_err(|_| "TV registration timed out")?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rcgen::{CertifiedKey, generate_simple_self_signed};
+    use rustls::{ServerConfig, pki_types::PrivatePkcs8KeyDer};
+    use tokio::net::TcpListener;
+    use tokio_rustls::TlsAcceptor;
+
+    const BUDGET: Duration = Duration::from_millis(200);
+
+    fn connect_stages(metrics: &Metrics) -> [(u64, u64, u64); 3] {
+        let snapshot = metrics.snapshot();
+        let stages = &snapshot.stages[&Operation::Connect];
+        [
+            Stage::TcpConnect,
+            Stage::TlsHandshake,
+            Stage::WebsocketHandshake,
+        ]
+        .map(|stage| {
+            let outcomes = &stages[&stage].outcomes;
+            (outcomes.success, outcomes.failure, outcomes.timeout)
+        })
+    }
+
+    #[tokio::test]
+    async fn silent_peer_times_out_in_the_tls_step() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = listener.local_addr().unwrap();
+        let metrics = Metrics::new(true);
+        let error = connect_path(endpoint, [0; 32], "/", &metrics, BUDGET)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(
+            error,
+            "TV connection timed out during the TLS handshake; nothing was sent"
+        );
+        assert_eq!(connect_stages(&metrics), [(1, 0, 0), (0, 0, 1), (0, 0, 0)]);
+        drop(listener);
+    }
+
+    #[tokio::test]
+    async fn peer_that_stalls_after_tls_times_out_in_the_websocket_step() {
+        let CertifiedKey { cert, signing_key } =
+            generate_simple_self_signed(vec!["example.invalid".into()]).unwrap();
+        let fingerprint: [u8; 32] = Sha256::digest(cert.der().as_ref()).into();
+        let config =
+            ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_no_client_auth()
+                .with_single_cert(
+                    vec![cert.der().clone()],
+                    PrivatePkcs8KeyDer::from(signing_key.serialize_der()).into(),
+                )
+                .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = listener.local_addr().unwrap();
+        let (release, held) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let _tls = TlsAcceptor::from(Arc::new(config))
+                .accept(stream)
+                .await
+                .unwrap();
+            let _ = held.await;
+        });
+        let metrics = Metrics::new(true);
+        let error = connect_path(endpoint, fingerprint, "/", &metrics, BUDGET)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(
+            error,
+            "TV connection timed out during the websocket handshake; nothing was sent"
+        );
+        assert_eq!(connect_stages(&metrics), [(1, 0, 0), (1, 0, 0), (0, 0, 1)]);
+        drop(release);
+        server.await.unwrap();
+    }
 }

@@ -6,6 +6,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 use webos_mcp::{
     capture::{CaptureConfig, CaptureSession},
+    metrics::Metrics,
     transport,
 };
 
@@ -257,7 +258,9 @@ pub async fn setup(re_pair: bool) -> Result<(), &'static str> {
         old,
         re_pair,
         |key| async move {
-            let mut socket = transport::connect(SocketAddr::new(address, 3001), pin).await?;
+            let mut socket =
+                transport::connect(SocketAddr::new(address, 3001), pin, &Metrics::new(false))
+                    .await?;
             transport::register(&mut socket, key.as_deref()).await
         },
         |record| save_credentials(record, true),
@@ -340,7 +343,12 @@ async fn migrate_local() -> Result<(), &'static str> {
     );
     let (address, mut record) = load_device_credentials()?;
     eprintln!("Verifying the TV before saving local credentials.");
-    let mut remote = transport::connect(SocketAddr::new(address, 3001), record.fingerprint).await?;
+    let mut remote = transport::connect(
+        SocketAddr::new(address, 3001),
+        record.fingerprint,
+        &Metrics::new(false),
+    )
+    .await?;
     record.client_key = transport::register(&mut remote, Some(&record.client_key)).await?;
     record.address = Some(address);
     let encoded = serde_json::to_string(&record).map_err(|_| "Could not encode credentials.")?;
@@ -376,7 +384,12 @@ async fn import_local() -> Result<(), &'static str> {
         return Err("Invalid credential input.");
     }
     eprintln!("Verifying the TV before saving local credentials.");
-    let mut remote = transport::connect(SocketAddr::new(address, 3001), record.fingerprint).await?;
+    let mut remote = transport::connect(
+        SocketAddr::new(address, 3001),
+        record.fingerprint,
+        &Metrics::new(false),
+    )
+    .await?;
     record.client_key = transport::register(&mut remote, Some(&record.client_key)).await?;
     let encoded = serde_json::to_string(&record).map_err(|_| "Could not encode credentials.")?;
     crate::local_store::save(&encoded, false)?;

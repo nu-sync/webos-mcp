@@ -6,7 +6,7 @@ use rustls::{ServerConfig, pki_types::PrivatePkcs8KeyDer};
 use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
-use webos_mcp::transport;
+use webos_mcp::{metrics::Metrics, transport};
 
 async fn simulated_tv(
     register: bool,
@@ -89,7 +89,7 @@ async fn simulated_tv(
 #[tokio::test]
 async fn verified_certificate_allows_websocket_connection() {
     let (endpoint, pin, server) = simulated_tv(false, false).await;
-    let _socket = transport::connect(endpoint, pin)
+    let _socket = transport::connect(endpoint, pin, &Metrics::new(false))
         .await
         .expect("verified connection");
     assert!(server.await.unwrap());
@@ -100,7 +100,7 @@ async fn changed_certificate_stops_before_websocket_or_registration() {
     let (endpoint, mut pin, server) = simulated_tv(false, false).await;
     pin[0] ^= 1;
     assert!(matches!(
-        transport::connect(endpoint, pin).await,
+        transport::connect(endpoint, pin, &Metrics::new(false)).await,
         Err("TV TLS authentication failed")
     ));
     assert!(!server.await.unwrap());
@@ -109,7 +109,9 @@ async fn changed_certificate_stops_before_websocket_or_registration() {
 #[tokio::test]
 async fn verified_connection_registers_with_existing_key() {
     let (endpoint, pin, server) = simulated_tv(true, false).await;
-    let mut socket = transport::connect(endpoint, pin).await.unwrap();
+    let mut socket = transport::connect(endpoint, pin, &Metrics::new(false))
+        .await
+        .unwrap();
     assert_eq!(
         transport::register(&mut socket, Some("synthetic-key"))
             .await
@@ -122,7 +124,9 @@ async fn verified_connection_registers_with_existing_key() {
 #[tokio::test]
 async fn preflight_detects_a_closed_socket_before_any_action() {
     let (endpoint, pin, server) = simulated_tv(false, false).await;
-    let mut socket = transport::connect(endpoint, pin).await.unwrap();
+    let mut socket = transport::connect(endpoint, pin, &Metrics::new(false))
+        .await
+        .unwrap();
     assert!(server.await.unwrap());
     assert!(matches!(
         socket.probe().await,
@@ -133,7 +137,9 @@ async fn preflight_detects_a_closed_socket_before_any_action() {
 #[tokio::test]
 async fn preflight_succeeds_when_peer_replies_to_ping() {
     let (endpoint, pin, server) = simulated_tv(false, true).await;
-    let mut socket = transport::connect(endpoint, pin).await.unwrap();
+    let mut socket = transport::connect(endpoint, pin, &Metrics::new(false))
+        .await
+        .unwrap();
     assert!(socket.probe().await.is_ok());
     assert!(server.await.unwrap());
 }

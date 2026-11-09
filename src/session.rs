@@ -57,9 +57,10 @@ impl LiveDevice {
         &mut self,
         endpoint: SocketAddr,
         fingerprint: [u8; 32],
+        metrics: &Metrics,
     ) -> Result<(), &'static str> {
         self.cleanup_unconfirmed = true;
-        let remote = transport::connect(endpoint, fingerprint).await;
+        let remote = transport::connect(endpoint, fingerprint, metrics).await;
         // A completed failed handshake drops its local socket. Cancellation does
         // not reach this point and must retain uncertainty.
         self.cleanup_unconfirmed = false;
@@ -398,7 +399,7 @@ impl SessionOwner<LiveDevice> {
             .stage(Operation::Connect, Stage::ConnectionSetup);
         let remote = s
             .device
-            .connect_control(endpoint, credentials.fingerprint)
+            .connect_control(endpoint, credentials.fingerprint, &self.metrics)
             .await;
         measurement.finish(result_outcome(&remote));
         remote?;
@@ -419,7 +420,7 @@ impl SessionOwner<LiveDevice> {
             .remote
             .as_mut()
             .unwrap()
-            .input_socket(endpoint, credentials.fingerprint)
+            .input_socket(endpoint, credentials.fingerprint, &self.metrics)
             .await;
         measurement.finish(result_outcome(&input));
         s.device.cleanup_unconfirmed = false;

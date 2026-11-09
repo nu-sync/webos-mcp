@@ -1,5 +1,5 @@
 use std::io::{self, Read};
-use webos_mcp::transport;
+use webos_mcp::{metrics::Metrics, transport};
 
 #[tokio::test]
 #[ignore = "requires an explicitly configured TV and verified certificate via private stdin"]
@@ -21,14 +21,17 @@ async fn connect_with_verified_certificate_and_existing_key() {
         *byte = u8::from_str_radix(&digest[i * 2..i * 2 + 2], 16).expect("valid fingerprint");
     }
     let key = lines.next().expect("pairing key");
-    let mut socket = transport::connect(endpoint, pin)
+    let mut socket = transport::connect(endpoint, pin, &Metrics::new(false))
         .await
         .expect("authenticated connection");
     match transport::register(&mut socket, Some(key)).await {
         Ok(returned_key) => assert!(returned_key == key, "TV returned a different key"),
         Err(error) => panic!("registration failed: {error}"),
     }
-    let mut input = match socket.input_socket(endpoint, pin).await {
+    let mut input = match socket
+        .input_socket(endpoint, pin, &Metrics::new(false))
+        .await
+    {
         Ok(value) => value,
         Err(error) => panic!("input socket failed: {error}"),
     };
