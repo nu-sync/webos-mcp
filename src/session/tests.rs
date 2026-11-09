@@ -361,6 +361,66 @@ async fn failed_disconnect_retains_closing_and_never_claims_already_disconnected
     assert_eq!(f.script.lock().unwrap().calls, ["close", "close"]);
 }
 
+async fn setup_in_progress(f: &Fixture) {
+    let mut state = f.owner.state.lock().await;
+    let State::Connected(s) = std::mem::replace(&mut *state, State::Disconnected) else {
+        unreachable!()
+    };
+    *state = State::Closing(s);
+}
+
+#[tokio::test]
+async fn failed_setup_with_confirmed_cleanup_returns_to_disconnected() {
+    let f = fixture(vec![]);
+    setup_in_progress(&f).await;
+    let failed: Result<(), _> = Err("setup failed");
+    assert_eq!(
+        f.owner.state.lock().await.finish_setup(failed).await,
+        Err("setup failed")
+    );
+    assert!(matches!(&*f.owner.state.lock().await, State::Disconnected));
+    assert_eq!(f.owner.disconnect().await, Ok("TV is already disconnected"));
+    assert_eq!(f.script.lock().unwrap().calls, ["close"]);
+}
+
+#[tokio::test]
+async fn failed_setup_with_unconfirmed_cleanup_stays_closing() {
+    let f = fixture(vec![]);
+    setup_in_progress(&f).await;
+    f.script.lock().unwrap().closes.push_back(IoStep::Error);
+    let failed: Result<(), _> = Err("setup failed");
+    assert_eq!(
+        f.owner.state.lock().await.finish_setup(failed).await,
+        Err("setup failed")
+    );
+    assert!(matches!(&*f.owner.state.lock().await, State::Closing(_)));
+    assert_eq!(f.owner.disconnect().await, Err("cleanup unconfirmed"));
+}
+
+#[tokio::test]
+async fn setup_cancelled_during_cleanup_stays_closing() {
+    let f = fixture(vec![]);
+    setup_in_progress(&f).await;
+    f.script.lock().unwrap().closes.push_back(IoStep::Pending);
+    let failed: Result<(), _> = Err("setup failed");
+    let mut state = f.owner.state.lock().await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(1), state.finish_setup(failed))
+            .await
+            .is_err()
+    );
+    assert!(matches!(&*state, State::Closing(_)));
+}
+
+#[tokio::test]
+async fn successful_setup_becomes_connected_without_closing() {
+    let f = fixture(vec![]);
+    setup_in_progress(&f).await;
+    assert_eq!(f.owner.state.lock().await.finish_setup(Ok(7)).await, Ok(7));
+    assert!(matches!(&*f.owner.state.lock().await, State::Connected(_)));
+    assert!(f.script.lock().unwrap().calls.is_empty());
+}
+
 #[tokio::test]
 async fn cancelled_disconnect_retains_closing_and_cleanup_uncertainty() {
     let f = fixture(vec![]);

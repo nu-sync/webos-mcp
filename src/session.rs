@@ -373,7 +373,7 @@ impl SessionOwner<LiveDevice> {
         measurement.finish(result_outcome(&loaded));
         let (address, mut credentials) = loaded?;
         let endpoint = SocketAddr::new(address, 3001);
-        // A failed or cancelled setup retains ownership and cleanup state.
+        // Setup owns its resources in `Closing` until `finish_setup` resolves it.
         *state = State::Closing(Box::new(Connected {
             _lock: lock,
             device: LiveDevice {
@@ -391,7 +391,26 @@ impl SessionOwner<LiveDevice> {
             healthy: true,
             marker: state_dir()?.join("action-state"),
         }));
-        let State::Closing(s) = &mut *state else {
+        let established = self
+            .establish(&mut state, endpoint, address, &mut credentials)
+            .await;
+        let has_capture = state.finish_setup(established).await?;
+        Ok(if pending {
+            "Connected; an earlier action has unresolved delivery. Actions are blocked."
+        } else if has_capture {
+            "Connected; capture is configured. Observe before acting."
+        } else {
+            "Connected; visual capture is unavailable. Actions are blocked."
+        })
+    }
+    async fn establish(
+        &self,
+        state: &mut State<LiveDevice>,
+        endpoint: SocketAddr,
+        address: std::net::IpAddr,
+        credentials: &mut setup::Credentials,
+    ) -> Result<bool, &'static str> {
+        let State::Closing(s) = state else {
             unreachable!()
         };
         let measurement = self
@@ -410,7 +429,7 @@ impl SessionOwner<LiveDevice> {
         )
         .await;
         measurement.finish(result_outcome(&key));
-        setup::persist_verified_credentials(&mut credentials, address, key?)?;
+        setup::persist_verified_credentials(credentials, address, key?)?;
         s.device.cleanup_unconfirmed = true;
         let measurement = self
             .metrics
@@ -425,7 +444,7 @@ impl SessionOwner<LiveDevice> {
         measurement.finish(result_outcome(&input));
         s.device.cleanup_unconfirmed = false;
         s.device.input = Some(input?);
-        if let Some(config) = credentials.ssh {
+        if let Some(config) = credentials.ssh.take() {
             s.device.cleanup_unconfirmed = true;
             let capture = RecoveringCapture::connect(CaptureConfig {
                 endpoint: SocketAddr::new(address, config.port),
@@ -442,18 +461,36 @@ impl SessionOwner<LiveDevice> {
             s.device.capture = Some(capture.map_err(|e| e.message())?);
             s.device.cleanup_unconfirmed = false;
         }
-        let has_capture = s.device.capture.is_some();
-        let State::Closing(s) = std::mem::replace(&mut *state, State::Disconnected) else {
+        Ok(s.device.capture.is_some())
+    }
+}
+
+impl<D: Device> State<D> {
+    /// Resolve a setup attempt that ran to completion. A known failure releases
+    /// what it owns and returns to `Disconnected` only when cleanup is confirmed.
+    /// A cancelled setup never reaches this and stays `Closing`.
+    async fn finish_setup<T>(
+        &mut self,
+        result: Result<T, &'static str>,
+    ) -> Result<T, &'static str> {
+        let State::Closing(s) = self else {
             unreachable!()
         };
-        *state = State::Connected(s);
-        Ok(if pending {
-            "Connected; an earlier action has unresolved delivery. Actions are blocked."
-        } else if has_capture {
-            "Connected; capture is configured. Observe before acting."
-        } else {
-            "Connected; visual capture is unavailable. Actions are blocked."
-        })
+        match result {
+            Ok(value) => {
+                let State::Closing(s) = std::mem::replace(self, State::Disconnected) else {
+                    unreachable!()
+                };
+                *self = State::Connected(s);
+                Ok(value)
+            }
+            Err(error) => {
+                if s.device.close().await.is_ok() {
+                    *self = State::Disconnected;
+                }
+                Err(error)
+            }
+        }
     }
 }
 
