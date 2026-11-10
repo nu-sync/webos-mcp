@@ -88,6 +88,18 @@ Typed capture failures distinguish connection and channel-open failures from req
 
 Errors carry a fixed public message and a typed outcome. Whether an operation timed out is recorded where its deadline expires, never inferred from message text. If the pending-delivery marker cannot be written before an action, nothing is sent, the call is reported as not sent, and the session requires a new observation without claiming unresolved delivery.
 
+### Command-line front end
+
+`webos-mcp call <tool>` and `webos-mcp session` exist so a person or test can exercise the tools without an MCP client. They are a second front end to the same server, not a second implementation: both start one `Front` (tool server, session owner, keepalive), call the same `tv_*` handler functions with the same parameter types, and release the session through the same shutdown path. The server and session are generic over the device, so tests run connected journeys through both front ends against a simulated TV; the binary only supplies the live device. The parameter types define the MCP input schema and the command-line options together, and a test fails if the two sets of tool names, properties, or required properties differ.
+
+Each call prints the tool result as one JSON line. Image data is written to a caller-chosen directory or reported by size instead of being inlined. `latest` in `--observation-id` is replaced, in the front end, by the observation ID of the most recent result in that session; the handler validates the resulting ID as usual, so this grants no authority an MCP client lacks. A session stops at the first failed or unparsable call unless told to continue, disconnects when its calls end, and exits nonzero on any failure or unconfirmed cleanup. Stdout carries only result lines.
+
+Known differences: argument-shape errors come from the argument parser on stderr and reach no handler, where MCP returns a protocol error; and calls are sequential, so the concurrent-call busy rejection cannot be produced. `acknowledge-delivery` remains a separate interactive command and is not a tool in either front end.
+
+### Stopping a front end
+
+A front end stops when its input ends (MCP transport closed, calls exhausted) or on an interrupt (Ctrl-C, or SIGTERM on Unix). Stopping first cancels any call still in flight, then waits for that call to release the session, then disconnects. Cancellation is the session's ordinary cancellation path: an action cut off before its send completed stays unresolved behind the durable marker, and a capture cut off after a completed send leaves nothing unresolved. A cancelled call is reported, if anyone is still listening, as stopped; a cancelled action is reported with delivery unknown and is never marked safe to repeat. This is the model's `Shutdown` transition. The MCP library does not drop a running handler when its client disappears, so without the explicit cancellation a call in flight would hold the session and shutdown could not confirm cleanup.
+
 ### Timeout and late delivery: implementation gate
 
 The session model blocks further actions while a timed-out or interrupted action is unresolved, even after a screenshot, disconnect, or reconnect. An abstract `DeliverySettled` event represents reliable evidence that the old action cannot take effect later. No such transport guarantee has yet been established. A screenshot or a reopened connection alone is insufficient; never automatically retry an uncertain action. Until a reliable mechanism is verified, keep actions blocked and report the uncertainty.

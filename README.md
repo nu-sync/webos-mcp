@@ -77,6 +77,28 @@ For example, `tv_press` with `{ "button": "RIGHT", "observation_id": "<latest ID
 
 Keep one server process and one session open while navigating.
 
+## From a terminal
+
+The same six tools run from the command line, through the same handlers the MCP server uses. This is for trying things out and for end-to-end tests; the safety rules below apply unchanged.
+
+```sh
+webos-mcp session --image-dir ./shots \
+  -c tv_connect \
+  -c tv_observe \
+  -c 'tv_press --button RIGHT --observation-id latest' \
+  -c tv_disconnect
+```
+
+- `session` runs calls in order against one connection and prints one JSON line per call: `{"tool": ..., "result": ...}`, where `result` is the tool result an MCP client would receive. Without `-c` it reads calls from stdin, one per line.
+- Options are the tool's input properties: `wait_ms` becomes `--wait-ms`. `webos-mcp call tv_press --help` lists them.
+- `latest` stands for the observation ID of the most recent result in the session, since a script cannot know it in advance. The server still checks the ID it receives.
+- Screenshots are saved to `--image-dir` (an existing directory; files are private on Unix) and reported by type, size, and path. Without it, only type and size are reported.
+- A session stops at the first failed call so a script never acts on top of a failure; `--keep-going` continues. The exit status is nonzero if any call failed or cleanup was unconfirmed. The session is disconnected when the calls end.
+- `call` runs a single tool in a fresh, disconnected server, as in `webos-mcp call tv_metrics`.
+- Ctrl-C cancels the call in flight and disconnects before exiting with status 130. An action cut off mid-send stays blocked as unresolved, as it would for an MCP client.
+
+Two differences from MCP remain: a malformed call is rejected by the argument parser with a message on stderr instead of an MCP protocol error, and calls run one at a time.
+
 ## Safety rules
 
 A TV is a shared screen, and a repeated button press can do the wrong thing. The server is strict about this:
@@ -111,6 +133,7 @@ Metrics stay in memory on your computer. They hold operation names, counts, dura
 | `webos-mcp setup --re-pair` | Ask the TV for a new authorization. |
 | `webos-mcp remove` | Delete local credentials. This does not revoke the authorization on the TV. |
 | `webos-mcp use-local-file` | Move an existing pairing into a private, unencrypted local file. |
+| `webos-mcp call <tool>` / `webos-mcp session` | Run the MCP tools from a terminal; see [From a terminal](#from-a-terminal). |
 | `webos-mcp acknowledge-delivery` | After you have checked the TV, clear a block left by an action whose delivery could not be confirmed. Asks for typed confirmation and never resends the action. |
 
 The local file avoids repeated credential-store prompts, but anyone who can read that file, including backups, can read the TV address and pairing key. On Unix the file is readable only by you; Windows permissions have not been verified. The server never falls back to plaintext on its own.
@@ -121,7 +144,7 @@ If `tv_disconnect` reports that cleanup could not be confirmed, the session stay
 
 ## Development
 
-These checks contact no TV and no credential store:
+These checks contact no TV and no credential store. They include connected journeys through both MCP and the command line against a simulated TV ([tests/e2e_simulated.rs](tests/e2e_simulated.rs)):
 
 ```sh
 cargo fmt --check
@@ -136,6 +159,8 @@ Tests named `tests/live_*.rs` are ignored by default because they contact, and i
 ```sh
 cargo test --release --test live_connect_stages -- --ignored --nocapture
 ```
+
+`live_observe` is also read-only: it captures screenshots into `WEBOS_MCP_EVIDENCE_DIR` without pressing anything, and can alternate with another server binary named by `WEBOS_MCP_BASELINE_BIN` for `WEBOS_MCP_OBSERVE_ROUNDS` rounds.
 
 More reading:
 

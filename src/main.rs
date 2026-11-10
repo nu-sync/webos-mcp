@@ -1,440 +1,121 @@
+//! Process wiring: choose a front end and attach it to the live TV.
+mod live;
 mod local_store;
-mod session;
 mod setup;
 
-use base64::Engine;
-use rmcp::{
-    ServiceExt,
-    handler::server::wrapper::Parameters,
-    model::{CallToolResult, ContentBlock},
-    tool, tool_router,
-    transport::stdio,
-};
-use schemars::JsonSchema;
-use serde::Deserialize;
-use serde_json::{Value, json};
-use session::{Action, ActionReport, Observation, ObserveOptions};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use clap::Parser;
+use rmcp::transport::stdio;
+use tokio::io::BufReader;
 use webos_mcp::{
-    error::TvError,
-    metrics::{Metrics, Operation, Outcome},
+    cli::{self, Calls, CallsOutcome, Cli, Command},
+    metrics::Metrics,
+    server::Front,
+    session::{SessionOwner, StateDir},
 };
 
-#[derive(Clone)]
-struct TvServer {
-    metrics: Metrics,
-    session: session::SessionOwner,
+/// The same started front end for MCP stdio and for the command line.
+fn front() -> Front<live::LiveDevice> {
+    let metrics = Metrics::new(
+        std::env::var_os("WEBOS_MCP_METRICS").as_deref() != Some(std::ffi::OsStr::new("0")),
+    );
+    let session = SessionOwner::new(
+        metrics.clone(),
+        StateDir::platform(),
+        live::LiveDevice::idle,
+    );
+    Front::start(metrics, session)
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-enum Button {
-    Up,
-    Down,
-    Left,
-    Right,
-    Enter,
-    Back,
-    Home,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-struct PressParams {
-    button: Button,
-    observation_id: String,
-    #[schemars(range(min = 1, max = 5))]
-    count: Option<u8>,
-    observe: Option<bool>,
-    #[schemars(range(min = 0, max = 5000))]
-    wait_ms: Option<u64>,
-    #[schemars(range(min = 0, max = 3000))]
-    change_timeout_ms: Option<u64>,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-struct LaunchParams {
-    app_id: String,
-    observation_id: String,
-    observe: Option<bool>,
-    #[schemars(range(min = 0, max = 5000))]
-    wait_ms: Option<u64>,
-    #[schemars(range(min = 0, max = 3000))]
-    change_timeout_ms: Option<u64>,
-}
-
-#[derive(Debug, Default, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-struct ObserveParams {
-    #[schemars(range(min = 0, max = 5000))]
-    wait_ms: Option<u64>,
-    #[schemars(range(min = 0, max = 3000))]
-    change_timeout_ms: Option<u64>,
-}
-
-fn observation_options(
-    wait: Option<u64>,
-    timeout: Option<u64>,
-    after_action: bool,
-) -> Result<ObserveOptions, &'static str> {
-    let wait = wait.unwrap_or(if after_action { 250 } else { 0 });
-    let timeout = timeout.unwrap_or(if after_action { 1000 } else { 0 });
-    if wait > 5000 {
-        return Err("wait_ms must be between 0 and 5000.");
+/// Resolves when the user or the parent process asks this process to stop.
+/// If no handler can be installed, it never resolves and the default applies.
+async fn interrupted() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let Ok(mut terminate) = signal(SignalKind::terminate()) else {
+            return std::future::pending().await;
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = terminate.recv() => {}
+        }
     }
-    if timeout > 3000 {
-        return Err("change_timeout_ms must be between 0 and 3000.");
+    #[cfg(not(unix))]
+    if tokio::signal::ctrl_c().await.is_err() {
+        std::future::pending::<()>().await;
     }
-    Ok(ObserveOptions {
-        wait: Duration::from_millis(wait),
-        change_timeout: Duration::from_millis(timeout),
-    })
 }
 
-/// Encoded image bytes and their MIME type, as captured.
-type Image = (Vec<u8>, &'static str);
+const CLEANUP_UNCONFIRMED: &str = "TV session cleanup could not be confirmed.";
 
-fn tool_result(metadata: Value, image: Option<Image>, failed: bool) -> CallToolResult {
-    let mut content = Vec::new();
-    if let Some((bytes, mime_type)) = image {
-        content.push(ContentBlock::image(
-            base64::engine::general_purpose::STANDARD.encode(bytes),
-            mime_type,
-        ));
-    }
-    content.push(ContentBlock::text(metadata.to_string()));
-    let mut result = if failed {
-        CallToolResult::error(content)
-    } else {
-        CallToolResult::success(content)
-    };
-    result.structured_content = Some(metadata);
-    result
-}
-
-fn observation_content(observation: Observation) -> (Value, Image) {
-    let metadata = json!({
-        "observation_id": observation.id,
-        "visual_change": observation.visual_change,
-        "delivery_unresolved": observation.delivery_unresolved,
-        "all_black": observation.image.all_black,
-        "width": observation.image.width,
-        "height": observation.image.height,
-        "capture_recovered": observation.image.recovered,
-        "ui_settled": "unknown",
-        "samples": observation.samples,
-        "elapsed_ms": observation.elapsed_ms,
-        "returned_at_unix_ms": SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis(),
-    });
-    (
-        metadata,
-        (observation.image.bytes, observation.image.mime_type),
+async fn run_tools(
+    calls: Calls<BufReader<tokio::io::Stdin>>,
+    output: cli::Output,
+    keep_going: bool,
+) -> Result<(), &'static str> {
+    let report = cli::run_calls(
+        front(),
+        calls,
+        output,
+        keep_going,
+        std::io::stdout(),
+        interrupted(),
     )
-}
-
-fn action_result(report: ActionReport) -> (CallToolResult, Outcome) {
-    let (mut metadata, image) = match report.observation {
-        Some(observation) => {
-            let (metadata, image) = observation_content(observation);
-            (metadata, Some(image))
-        }
-        None => (json!({}), None),
-    };
-    metadata["delivery"] = json!(report.delivery);
-    metadata["action_error"] = json!(report.error.map(TvError::message));
-    metadata["observation_error"] = json!(report.observation_error.map(TvError::message));
-    metadata["do_not_repeat_action"] = json!(true);
-    let failed = report.error.is_some()
-        || report.observation_error.is_some()
-        || metadata["delivery"] == "unknown";
-    let outcome = if failed {
-        if report
-            .error
-            .into_iter()
-            .chain(report.observation_error)
-            .any(|error| error.outcome() == Outcome::Timeout)
-        {
-            Outcome::Timeout
-        } else {
-            Outcome::Failure
-        }
-    } else {
-        Outcome::Success
-    };
-    (tool_result(metadata, image, failed), outcome)
-}
-
-fn action_rejected(error: impl Into<TvError>) -> CallToolResult {
-    let message = error.into().message();
-    tool_result(
-        json!({"delivery":"not_sent", "action_error":message, "do_not_repeat_action":false}),
-        None,
-        true,
-    )
-}
-
-fn message_result(value: Result<&'static str, TvError>) -> (CallToolResult, Outcome) {
-    match value {
-        Ok(message) => (
-            CallToolResult::success(vec![ContentBlock::text(message)]),
-            Outcome::Success,
-        ),
-        Err(error) => (
-            CallToolResult::error(vec![ContentBlock::text(error.message())]),
-            error.outcome(),
-        ),
+    .await?;
+    if !report.cleanup_confirmed {
+        eprintln!("{CLEANUP_UNCONFIRMED}");
     }
-}
-
-#[tool_router(server_handler)]
-impl TvServer {
-    #[tool(description = "Connect to the configured TV without waking it.")]
-    async fn tv_connect(&self) -> CallToolResult {
-        let measurement = self.metrics.begin(Operation::Connect);
-        let (result, outcome) = message_result(self.session.connect().await);
-        measurement.finish(outcome);
-        result
-    }
-
-    #[tool(
-        description = "Capture a fresh TV image (JPEG by default) and observation ID, optionally waiting for pixel changes. A change or delay does not prove the UI settled."
-    )]
-    async fn tv_observe(&self, Parameters(params): Parameters<ObserveParams>) -> CallToolResult {
-        let measurement = self.metrics.begin(Operation::Observe);
-        let options = match observation_options(params.wait_ms, params.change_timeout_ms, false) {
-            Ok(options) => options,
-            Err(error) => {
-                measurement.finish(Outcome::Failure);
-                return tool_result(json!({"observation_error":error}), None, true);
-            }
-        };
-        match self.session.observe(options).await {
-            Ok(observation) => {
-                let (metadata, image) = observation_content(observation);
-                measurement.finish(Outcome::Success);
-                tool_result(metadata, Some(image), false)
-            }
-            Err(error) => {
-                measurement.finish(error.outcome());
-                tool_result(json!({"observation_error":error.message()}), None, true)
-            }
+    match report.calls {
+        CallsOutcome::Interrupted => {
+            eprintln!("Interrupted; any call in flight was cancelled.");
+            std::process::exit(130);
         }
-    }
-
-    #[tool(
-        description = "Send one to five paced button presses using the latest observation ID. Returns a new screenshot by default. Never repeat an action merely because its screenshot failed."
-    )]
-    async fn tv_press(&self, Parameters(params): Parameters<PressParams>) -> CallToolResult {
-        let measurement = self.metrics.begin(Operation::Press);
-        let options = match observation_options(params.wait_ms, params.change_timeout_ms, true) {
-            Ok(options) => options,
-            Err(error) => {
-                measurement.finish(Outcome::Failure);
-                return action_rejected(error);
-            }
-        };
-        if !matches!(params.count.unwrap_or(1), 1..=5) {
-            measurement.finish(Outcome::Failure);
-            return action_rejected("count must be between 1 and 5.");
+        CallsOutcome::SomeFailed => Err("A tool call failed."),
+        CallsOutcome::AllSucceeded if !report.cleanup_confirmed => {
+            Err("The calls succeeded, but cleanup is unconfirmed.")
         }
-        if params.observation_id.trim().is_empty() {
-            measurement.finish(Outcome::Failure);
-            return action_rejected("observation_id must not be empty.");
-        }
-        let button = match params.button {
-            Button::Up => "UP",
-            Button::Down => "DOWN",
-            Button::Left => "LEFT",
-            Button::Right => "RIGHT",
-            Button::Enter => "ENTER",
-            Button::Back => "BACK",
-            Button::Home => "HOME",
-        };
-        let response = self
-            .session
-            .act(
-                Action::Press {
-                    button: button.into(),
-                    count: params.count.unwrap_or(1),
-                },
-                &params.observation_id,
-                params.observe.unwrap_or(true).then_some(options),
-            )
-            .await;
-        let (result, outcome) = match response {
-            Ok(report) => action_result(report),
-            Err(error) => (action_rejected(error), error.outcome()),
-        };
-        measurement.finish(outcome);
-        result
-    }
-
-    #[tool(
-        description = "Launch an app using the latest observation ID; returns a new screenshot by default. Local send completion and visual confirmation are separate results."
-    )]
-    async fn tv_launch(&self, Parameters(params): Parameters<LaunchParams>) -> CallToolResult {
-        let measurement = self.metrics.begin(Operation::Launch);
-        let options = match observation_options(params.wait_ms, params.change_timeout_ms, true) {
-            Ok(options) => options,
-            Err(error) => {
-                measurement.finish(Outcome::Failure);
-                return action_rejected(error);
-            }
-        };
-        if params.app_id.trim().is_empty() {
-            measurement.finish(Outcome::Failure);
-            return action_rejected("app_id must not be empty.");
-        }
-        if params.observation_id.trim().is_empty() {
-            measurement.finish(Outcome::Failure);
-            return action_rejected("observation_id must not be empty.");
-        }
-        let response = self
-            .session
-            .act(
-                Action::Launch {
-                    app_id: params.app_id,
-                },
-                &params.observation_id,
-                params.observe.unwrap_or(true).then_some(options),
-            )
-            .await;
-        let (result, outcome) = match response {
-            Ok(report) => action_result(report),
-            Err(error) => (action_rejected(error), error.outcome()),
-        };
-        measurement.finish(outcome);
-        result
-    }
-
-    #[tool(description = "Close the TV session, reporting any unconfirmed cleanup.")]
-    async fn tv_disconnect(&self) -> CallToolResult {
-        let measurement = self.metrics.begin(Operation::Disconnect);
-        let (result, outcome) = message_result(self.session.disconnect().await);
-        measurement.finish(outcome);
-        result
-    }
-
-    #[tool(
-        description = "Read local aggregate timings and outcomes without contacting the TV. No screen, device, or request data is collected."
-    )]
-    fn tv_metrics(&self) -> CallToolResult {
-        CallToolResult::structured(json!(self.metrics.snapshot()))
+        CallsOutcome::AllSucceeded => Ok(()),
     }
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    match setup::run_cli().await {
-        Ok(true) => return Ok(()),
-        Ok(false) => {}
-        Err(message) => {
-            eprintln!("{message}");
-            std::process::exit(1);
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let outcome = match Cli::parse().command {
+        None => {
+            if !front().serve(stdio(), interrupted()).await? {
+                eprintln!("{CLEANUP_UNCONFIRMED}");
+            }
+            // The session is released. Exit instead of returning: after a
+            // signal, stdin is still open and the runtime would wait on its
+            // blocked reader forever.
+            std::process::exit(0);
         }
+        Some(Command::Setup { re_pair }) => setup::setup(re_pair).await,
+        Some(Command::UseLocalFile {
+            import_stdin: false,
+        }) => setup::migrate_local().await,
+        Some(Command::UseLocalFile { import_stdin: true }) => setup::import_local().await,
+        Some(Command::AcknowledgeDelivery) => setup::acknowledge_delivery(),
+        Some(Command::Remove) => setup::remove(),
+        Some(Command::Call { output, tool }) => {
+            run_tools(Calls::One(Box::new(tool)), output, false).await
+        }
+        Some(Command::Session {
+            output,
+            keep_going,
+            calls,
+        }) => {
+            let calls = if calls.is_empty() {
+                Calls::Reader(BufReader::new(tokio::io::stdin()))
+            } else {
+                Calls::Lines(calls)
+            };
+            run_tools(calls, output, keep_going).await
+        }
+    };
+    if let Err(message) = outcome {
+        eprintln!("{message}");
+        std::process::exit(1);
     }
-    let metrics = Metrics::new(
-        std::env::var_os("WEBOS_MCP_METRICS").as_deref() != Some(std::ffi::OsStr::new("0")),
-    );
-    let session = session::SessionOwner::new(metrics.clone());
-    let server = TvServer {
-        metrics,
-        session: session.clone(),
-    }
-    .serve(stdio())
-    .await?;
-    let keepalive = session.start_keepalive();
-    let result = server.waiting().await;
-    keepalive.abort();
-    let _ = keepalive.await;
-    if session.disconnect().await.is_err() {
-        eprintln!("TV session cleanup could not be confirmed.");
-    }
-    result?;
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use session::Delivery;
-
-    #[test]
-    fn sent_action_with_failed_capture_preserves_delivery_and_returns_no_image() {
-        let (result, outcome) = action_result(ActionReport {
-            delivery: Delivery::Sent,
-            error: None,
-            observation: None,
-            observation_error: Some(TvError::timeout("Capture timed out")),
-        });
-        assert_eq!(result.is_error, Some(true));
-        assert_eq!(outcome, Outcome::Timeout);
-        assert!(
-            result
-                .content
-                .iter()
-                .all(|block| block.as_image().is_none())
-        );
-        let metadata = result.structured_content.unwrap();
-        assert_eq!(metadata["delivery"], "sent");
-        assert_eq!(metadata["action_error"], Value::Null);
-        assert_eq!(metadata["observation_error"], "Capture timed out");
-        assert_eq!(metadata["do_not_repeat_action"], true);
-        assert!(metadata.get("observation_id").is_none());
-    }
-
-    #[test]
-    fn uncertain_action_cannot_be_rendered_as_a_safe_rejection() {
-        let (result, outcome) = action_result(ActionReport {
-            delivery: Delivery::Unknown,
-            error: Some(TvError::failure("Button delivery is uncertain")),
-            observation: None,
-            observation_error: None,
-        });
-        assert_eq!(result.is_error, Some(true));
-        assert_eq!(outcome, Outcome::Failure);
-        let metadata = result.structured_content.unwrap();
-        assert_eq!(metadata["delivery"], "unknown");
-        assert_eq!(metadata["do_not_repeat_action"], true);
-        assert!(metadata.get("observation_id").is_none());
-    }
-
-    #[test]
-    fn successful_combined_result_returns_the_new_frame_and_its_observation_id() {
-        let (result, outcome) = action_result(ActionReport {
-            delivery: Delivery::Sent,
-            error: None,
-            observation: Some(Observation {
-                image: webos_mcp::capture::CapturedImage {
-                    bytes: vec![1, 2, 3],
-                    mime_type: "image/jpeg",
-                    all_black: false,
-                    fingerprint: [0; 32],
-                    width: 1,
-                    height: 1,
-                    recovered: true,
-                },
-                id: "synthetic-session-2".into(),
-                visual_change: session::VisualChange::Changed,
-                delivery_unresolved: false,
-                samples: 2,
-                elapsed_ms: 300,
-            }),
-            observation_error: None,
-        });
-        assert_eq!(outcome, Outcome::Success);
-        assert_ne!(result.is_error, Some(true));
-        let image = result.content[0].as_image().unwrap();
-        assert_eq!(image.data, "AQID");
-        assert_eq!(image.mime_type, "image/jpeg");
-        let metadata = result.structured_content.unwrap();
-        assert_eq!(metadata["observation_id"], "synthetic-session-2");
-        assert_eq!(metadata["visual_change"], "changed");
-        assert_eq!(metadata["delivery"], "sent");
-        assert_eq!(metadata["ui_settled"], "unknown");
-        assert_eq!(metadata["capture_recovered"], true);
-        assert_eq!(metadata["samples"], 2);
-        assert_eq!(metadata["elapsed_ms"], 300);
-    }
 }

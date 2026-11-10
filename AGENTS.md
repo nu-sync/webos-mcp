@@ -21,14 +21,17 @@ cargo build --release
 
 Use the optimized binary for normal MCP operation and performance measurements. Keep stdout exclusively for MCP protocol messages; send diagnostics to stderr. Run setup as a separate interactive command, never inside the stdio protocol.
 
-- `src/main.rs`: tool schemas, input validation, result formatting, and operation metrics.
-- `src/session.rs`: observation authority, action delivery, request arbitration, and lifecycle ownership.
+- `src/main.rs`: process wiring only; picks a front end, attaches the live device, and maps signals to an interrupt.
+- `src/server.rs`: tool schemas, input validation, result formatting, operation metrics, and `Front`, the start/serve/stop lifecycle both front ends share. The parameter structs define the MCP schema and the CLI options together. Generic over the device.
+- `src/cli.rs`: the clap command line. `call` and `session` reach the same `tv_*` handlers as MCP; add a tool to both or the drift test fails. Keep stdout to result lines.
+- `src/live.rs`: the live TV device; the only code that joins credentials, transport, and capture.
+- `src/session.rs`: observation authority, action delivery, request arbitration, and lifecycle ownership, over any `Device` and an injectable state directory.
 - `src/transport.rs`: pinned control and button connections.
 - `src/capture.rs`: trusted SSH capture, bounded recovery, image validation, and capture-stage metrics.
 - `src/setup.rs` and `src/local_store.rs`: onboarding and credential persistence.
 - `src/error.rs`: the shared error type; a fixed message plus a typed timeout or failure outcome.
 - `src/metrics.rs`: bounded, in-memory aggregates with fixed labels.
-- `tests/stdio.rs`: compiled-server protocol checks. `tests/live_*.rs` are opt-in checks that can contact or control the configured TV; inspect each test before running it.
+- `tests/stdio.rs`: compiled-server protocol checks. `tests/cli_equivalence.rs` runs the same calls through the compiled binary's MCP and CLI front ends and compares results. `tests/e2e_simulated.rs` does the same for connected journeys, interrupts, and acknowledgement against the simulated TV in `tests/support/simulated_tv.rs`; label its results simulated. `tests/live_*.rs` are opt-in checks that can contact or control the configured TV; inspect each test before running it.
 
 ## Design and lifecycle
 

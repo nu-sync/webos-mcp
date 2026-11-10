@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use webos_mcp::{
     capture::{CaptureConfig, CaptureSession},
     metrics::Metrics,
+    session::{StateDir, acquire_lock},
     transport,
 };
 
@@ -126,18 +127,18 @@ fn save_credentials(record: &Credentials, verify: bool) -> Result<(), &'static s
 
 pub fn load_device_credentials() -> Result<(IpAddr, Credentials), &'static str> {
     let credentials = load_credentials()?.ok_or("Run setup to pair the TV")?;
-    crate::session::diagnostic("TV credential entry loaded");
+    webos_mcp::session::diagnostic("TV credential entry loaded");
     let address = match credentials.address {
         Some(address) => address,
         None => {
             if crate::local_store::read()?.is_some() {
                 return Err("Local credentials have no TV address.");
             }
-            crate::session::diagnostic("loading legacy address");
+            webos_mcp::session::diagnostic("loading legacy address");
             load_address()?
         }
     };
-    crate::session::diagnostic("TV address loaded");
+    webos_mcp::session::diagnostic("TV address loaded");
     Ok((address, credentials))
 }
 
@@ -222,7 +223,7 @@ where
 }
 
 pub async fn setup(re_pair: bool) -> Result<(), &'static str> {
-    let _lock = crate::session::acquire_lock()?;
+    let _lock = acquire_lock(&StateDir::platform())?;
     eprintln!("Enter the TV IP address from its network settings. Input is hidden.");
     eprintln!("If an address is already saved, press Enter to keep it.");
     let address = rpassword::prompt_password("TV IP address: ")
@@ -317,8 +318,8 @@ pub async fn setup(re_pair: bool) -> Result<(), &'static str> {
     Ok(())
 }
 
-fn remove() -> Result<(), &'static str> {
-    let _lock = crate::session::acquire_lock()?;
+pub fn remove() -> Result<(), &'static str> {
+    let _lock = acquire_lock(&StateDir::platform())?;
     for account in ["tv-credentials", ACCOUNT] {
         let entry = keyring::Entry::new(SERVICE, account)
             .map_err(|_| "Secure credential store is unavailable.")?;
@@ -336,10 +337,10 @@ fn remove() -> Result<(), &'static str> {
 
 /// Clear an unresolved delivery only on the user's explicit, informed say-so.
 /// This runs outside the MCP protocol so an agent cannot unblock itself.
-fn acknowledge_delivery() -> Result<(), &'static str> {
-    use crate::session::Acknowledgement;
-    let lock = crate::session::acquire_lock()?;
-    let outcome = crate::session::acknowledge_delivery(&lock, || {
+pub fn acknowledge_delivery() -> Result<(), &'static str> {
+    use webos_mcp::session::Acknowledgement;
+    let lock = acquire_lock(&StateDir::platform())?;
+    let outcome = webos_mcp::session::acknowledge_delivery(&StateDir::platform(), &lock, || {
         eprintln!(
             "An earlier TV action was sent or interrupted without confirmation. It may have been\napplied, may never arrive, or could still arrive late; this tool cannot tell which.\n\nLook at the TV. If its current state is acceptable and you accept that the earlier\naction will not be retried or undone, type `acknowledge` and press Enter."
         );
@@ -364,8 +365,8 @@ fn acknowledge_delivery() -> Result<(), &'static str> {
     }
 }
 
-async fn migrate_local() -> Result<(), &'static str> {
-    let _lock = crate::session::acquire_lock()?;
+pub async fn migrate_local() -> Result<(), &'static str> {
+    let _lock = acquire_lock(&StateDir::platform())?;
     if crate::local_store::read()?.is_some() {
         load_credentials()?.ok_or("Local credentials are invalid.")?;
         println!("Local credential file is already configured.");
@@ -396,9 +397,9 @@ async fn migrate_local() -> Result<(), &'static str> {
     Ok(())
 }
 
-async fn import_local() -> Result<(), &'static str> {
+pub async fn import_local() -> Result<(), &'static str> {
     use std::io::Read;
-    let _lock = crate::session::acquire_lock()?;
+    let _lock = acquire_lock(&StateDir::platform())?;
     if crate::local_store::read()?.is_some() {
         return Err("Local credentials already exist; they were not changed.");
     }
@@ -447,48 +448,6 @@ async fn verify_capture(address: IpAddr, ssh: &SshConfig) -> Result<(), &'static
     let mut capture = CaptureSession::connect(&config).await?;
     capture.capture().await.map_err(|error| error.message())?;
     capture.close().await
-}
-
-pub async fn run_cli() -> Result<bool, &'static str> {
-    let mut args = std::env::args_os().skip(1);
-    match (args.next(), args.next()) {
-        (None, None) => Ok(false),
-        (Some(command), None) if command == "setup" => {
-            setup(false).await?;
-            Ok(true)
-        }
-        (Some(command), Some(option)) if command == "setup" && option == "--re-pair" => {
-            setup(true).await?;
-            Ok(true)
-        }
-        (Some(command), None) if command == "remove" => {
-            remove()?;
-            Ok(true)
-        }
-        (Some(command), None) if command == "acknowledge-delivery" => {
-            acknowledge_delivery()?;
-            Ok(true)
-        }
-        (Some(command), None) if command == "use-local-file" => {
-            migrate_local().await?;
-            Ok(true)
-        }
-        (Some(command), Some(option))
-            if command == "use-local-file" && option == "--import-stdin" =>
-        {
-            import_local().await?;
-            Ok(true)
-        }
-        (Some(command), None) if command == "--help" || command == "-h" => {
-            println!(
-                "Usage: webos-mcp [setup [--re-pair] | use-local-file | acknowledge-delivery | remove]\n\nRun without arguments to start the MCP stdio server.\nRun use-local-file to copy existing paired credentials into an unencrypted local file.\nRun acknowledge-delivery after checking the TV to unblock actions following an unresolved delivery."
-            );
-            Ok(true)
-        }
-        _ => Err(
-            "Usage: webos-mcp [setup [--re-pair] | use-local-file | acknowledge-delivery | remove]",
-        ),
-    }
 }
 
 #[cfg(test)]
