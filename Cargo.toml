@@ -3,6 +3,9 @@ name = "webos-mcp"
 version = "0.1.0"
 edition = "2024"
 publish = false
+license = "MIT"
+repository = "https://github.com/nu-sync/webos-mcp"
+description = "A local MCP server for visually navigating LG webOS TVs"
 
 [dependencies]
 rmcp = { version = "3.8.0", features = ["transport-io", "schemars"] }

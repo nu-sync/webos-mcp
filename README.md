@@ -70,3 +70,7 @@ A separate CPU-only aggregation check is available without TV access:
 ```sh
 cargo test --test live_performance metrics_overhead -- --ignored --nocapture
 ```
+
+## License
+
+[MIT](LICENSE)
