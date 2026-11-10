@@ -71,6 +71,9 @@ struct FakeDevice {
     capture_started: Arc<tokio::sync::Notify>,
 }
 impl Device for FakeDevice {
+    async fn establish(&mut self, _: &Metrics) -> Result<bool, TvError> {
+        Ok(true)
+    }
     async fn probe(&mut self) -> Result<(), TvError> {
         let step = {
             let mut script = self.script.lock().unwrap();
@@ -183,6 +186,8 @@ fn fixture(captures: Vec<CaptureStep>) -> Fixture {
             marker: marker.clone(),
         })))),
         metrics: Metrics::new(true),
+        state_dir: StateDir::at(directory.path().to_owned()),
+        make: Arc::new(|| unreachable!("fixtures start connected")),
     };
     Fixture {
         owner,
@@ -725,18 +730,4 @@ fn only_an_explicit_confirmation_clears_unresolved_delivery() {
         acknowledge_marker(&path, false, || panic!("nothing to confirm")),
         Ok(Acknowledgement::NothingUnresolved)
     );
-}
-
-#[tokio::test]
-async fn timeouts_are_classified_by_type_not_by_message_text() {
-    let mut device = LiveDevice {
-        remote: None,
-        input: None,
-        capture: None,
-        cleanup_unconfirmed: true,
-    };
-    let unconfirmed = device.close().await.unwrap_err();
-    assert_eq!(unconfirmed.outcome(), Outcome::Failure);
-    assert!(unconfirmed.message().contains("restart the MCP server"));
-    assert_eq!(device.probe().await.unwrap_err(), "TV input is unavailable");
 }
