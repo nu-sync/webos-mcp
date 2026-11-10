@@ -26,6 +26,7 @@ Use the optimized binary for normal MCP operation and performance measurements. 
 - `src/transport.rs`: pinned control and button connections.
 - `src/capture.rs`: trusted SSH capture, bounded recovery, image validation, and capture-stage metrics.
 - `src/setup.rs` and `src/local_store.rs`: onboarding and credential persistence.
+- `src/error.rs`: the shared error type; a fixed message plus a typed timeout or failure outcome.
 - `src/metrics.rs`: bounded, in-memory aggregates with fixed labels.
 - `tests/stdio.rs`: compiled-server protocol checks. `tests/live_*.rs` are opt-in checks that can contact or control the configured TV; inspect each test before running it.
 
@@ -37,12 +38,12 @@ Use the optimized binary for normal MCP operation and performance measurements. 
 - Keep control pairing separate from screenshot capability. Do not assume a TV is rooted or that compositor capture includes video, HDMI, or protected content. Report unsupported or unverified capabilities clearly.
 - Prefer one owner for the session and its resources. Reject concurrent or stale actions, and clean up only connections, tunnels, and temporary files created by the task. Keep failed or cancelled cleanup in `Closing`; never report a clean disconnect merely because close was requested. Separate action delivery from observation errors so a failed screenshot cannot cause a repeated button.
 - Preserve the separate user-request gate and device-state lock. Reject overlapping user requests; let the active request wait for a bounded internal keepalive, then recheck health and observation identity. A keepalive must not make ordinary navigation or disconnect fail as busy.
-- Retry capture only under the typed recovery policy: a pre-command channel-open failure may close and reconnect once when cleanup is confirmed. Known failed setup and interrupted setup have different cleanup guarantees. Never recover by replaying an action or clearing the durable delivery guard.
+- Retry capture only under the typed recovery policy: a pre-command channel-open failure may close and reconnect once when cleanup is confirmed. Known failed setup and interrupted setup have different cleanup guarantees. Never recover by replaying an action or clearing the durable delivery guard. The guard is cleared only by the interactive `acknowledge-delivery` command after a person confirms; keep that path out of every MCP tool.
 - Pixel-change sampling is bounded to four captures. `change_timeout_ms` limits when another sample may start; it is not a whole-operation deadline. Keep `ui_settled` unknown and report black frames honestly. Sampling and recovery must not return an old image after failure.
 
 ## Engineering decisions
 
-Keep changes simple and follow existing conventions. **Model the Domain** means lifecycle and observation authority belong to explicit state transitions. **Fix Root Causes** means preserve regression tests for the demonstrated failure instead of adding blind retries. **Explain the Number** means distinguish measured RPC time, capture stages, and unmeasured model reasoning. **Prove It Works** means exercise the actual session or compiled MCP interface, then inspect images for claims about visible behavior.
+Keep changes simple and follow existing conventions. Classify timeouts with `TvError::timeout` at the deadline, not by matching message text. **Model the Domain** means lifecycle and observation authority belong to explicit state transitions. **Fix Root Causes** means preserve regression tests for the demonstrated failure instead of adding blind retries. **Explain the Number** means distinguish measured RPC time, capture stages, and unmeasured model reasoning. **Prove It Works** means exercise the actual session or compiled MCP interface, then inspect images for claims about visible behavior.
 
 Metrics must contain only fixed operation/stage names, counts, durations, and outcome categories. Never add addresses, app IDs, button sequences, screen contents, credentials, or raw errors as labels. Preserve `WEBOS_MCP_METRICS=0`, cancellation accounting, and metrics reads that do not wait for TV I/O.
 

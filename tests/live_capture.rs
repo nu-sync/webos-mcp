@@ -17,6 +17,7 @@ async fn capture_from_trusted_tv() {
         .await
         .expect("trusted SSH connection");
     let image = ssh.capture().await.expect("fresh compositor image");
-    assert!(image.png.starts_with(b"\x89PNG\r\n\x1a\n"));
+    assert!(matches!(image.mime_type, "image/jpeg" | "image/png"));
+    assert!(!image.bytes.is_empty());
     ssh.close().await.expect("close SSH session");
 }

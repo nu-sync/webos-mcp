@@ -48,7 +48,7 @@ Setup asks for:
   openssl s_client -connect 127.0.0.1:3001 </dev/null 2>/dev/null | openssl x509 -noout -fingerprint -sha256
   ```
 
-- **Optional SSH details for screenshots**: user, port, agent socket or pipe, and public key file.
+- **Optional SSH details for screenshots**: user, port, agent socket or pipe, and public key file. Press Enter at the agent prompt to use `SSH_AUTH_SOCK` from the server's environment each time it connects; a saved path that stops working also falls back to it.
 
 Approve the pairing prompt on the TV. Credentials are saved in your operating system's credential store.
 
@@ -82,7 +82,7 @@ Keep one server process and one session open while navigating.
 A TV is a shared screen, and a repeated button press can do the wrong thing. The server is strict about this:
 
 - **Look before you act.** Every action needs the ID from the latest screenshot. An old ID is rejected before anything is sent.
-- **No automatic retries.** If the server cannot tell whether a button press reached the TV, it blocks further actions, even after reconnecting, rather than risk sending it twice.
+- **No automatic retries.** If the server cannot tell whether a button press reached the TV, it blocks further actions, even after reconnecting, rather than risk sending it twice. Only you can lift that block: look at the TV, then run `webos-mcp acknowledge-delivery` in a terminal. An agent cannot do this through MCP.
 - **Sent is not the same as applied.** `delivery: sent` means the message left your computer. Check the screenshot to see what the TV did.
 - **A failed screenshot never returns an old image.** If the screenshot after an action fails, do not repeat the action; call `tv_observe`.
 - **A new screenshot does not mean the screen has settled.** `ui_settled` is always `unknown`.
@@ -97,13 +97,13 @@ Set these in the MCP server's environment before it starts.
 
 | Variable | Effect |
 | --- | --- |
-| `WEBOS_MCP_LOSSLESS=1` | Capture lossless PNG. By default the TV captures JPEG for speed and the server returns it as a PNG of the decoded pixels. |
+| `WEBOS_MCP_LOSSLESS=1` | Capture lossless PNG. By default the TV captures JPEG for speed and the server returns that JPEG unchanged, after decoding it once to validate it. |
 | `WEBOS_MCP_METRICS=0` | Turn off metrics collection. |
 | `WEBOS_MCP_DIAGNOSTICS=1` | Print connection-stage diagnostics to stderr. |
 
 Metrics stay in memory on your computer. They hold operation names, counts, durations, and outcomes, and never screen content, device identifiers, or button names.
 
-## Managing credentials
+## Commands
 
 | Command | What it does |
 | --- | --- |
@@ -111,10 +111,13 @@ Metrics stay in memory on your computer. They hold operation names, counts, dura
 | `webos-mcp setup --re-pair` | Ask the TV for a new authorization. |
 | `webos-mcp remove` | Delete local credentials. This does not revoke the authorization on the TV. |
 | `webos-mcp use-local-file` | Move an existing pairing into a private, unencrypted local file. |
+| `webos-mcp acknowledge-delivery` | After you have checked the TV, clear a block left by an action whose delivery could not be confirmed. Asks for typed confirmation and never resends the action. |
 
 The local file avoids repeated credential-store prompts, but anyone who can read that file, including backups, can read the TV address and pairing key. On Unix the file is readable only by you; Windows permissions have not been verified. The server never falls back to plaintext on its own.
 
 Your operating system may ask you to unlock or approve credential access, especially after you rebuild the binary.
+
+If `tv_disconnect` reports that cleanup could not be confirmed, the session stays closed to new work on purpose. Restart the MCP server to release it; the error says so.
 
 ## Development
 
@@ -126,7 +129,7 @@ cargo clippy --all-targets -- -D warnings
 cargo test --all-targets
 ```
 
-The session lifecycle is also model-checked with TLA+; see [statechart/README.md](statechart/README.md).
+The session lifecycle is also model-checked with TLA+; see [statechart/README.md](statechart/README.md). CI additionally runs `cargo deny check` against [deny.toml](deny.toml) for advisories, licenses, and sources.
 
 Tests named `tests/live_*.rs` are ignored by default because they contact, and in some cases control, the configured TV. Read a test before running it. Those that save screenshots need `WEBOS_MCP_EVIDENCE_DIR` set to a private directory outside this repository. For example, this one connects, reports connect timings, and disconnects without pressing anything:
 

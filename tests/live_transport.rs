@@ -28,10 +28,7 @@ async fn connect_with_verified_certificate_and_existing_key() {
         Ok(returned_key) => assert!(returned_key == key, "TV returned a different key"),
         Err(error) => panic!("registration failed: {error}"),
     }
-    let mut input = match socket
-        .input_socket(endpoint, pin, &Metrics::new(false))
-        .await
-    {
+    let mut input = match socket.input_socket(endpoint, &Metrics::new(false)).await {
         Ok(value) => value,
         Err(error) => panic!("input socket failed: {error}"),
     };

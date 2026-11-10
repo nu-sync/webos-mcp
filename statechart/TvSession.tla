@@ -22,6 +22,7 @@ ActionAcknowledged == /\ phase = "acting" /\ phase' = "needs_observation" /\ las
 ActionTimeout == /\ phase = "acting" /\ phase' = "uncertain" /\ lastResult' = "action_uncertain" /\ unresolved' = TRUE /\ UNCHANGED <<resources, lateApplied, durable>>
 LateDelivery == /\ unresolved /\ ~lateApplied /\ lateApplied' = TRUE /\ UNCHANGED <<phase, lastResult, resources, unresolved, durable>>
 DeliverySettled == /\ phase = "uncertain" /\ unresolved /\ phase' = "needs_observation" /\ lastResult' = "none" /\ unresolved' = FALSE /\ durable' = FALSE /\ UNCHANGED <<resources, lateApplied>>
+AcknowledgeDelivery == /\ phase = "disconnected" /\ unresolved /\ unresolved' = FALSE /\ durable' = FALSE /\ UNCHANGED <<phase, lastResult, resources, lateApplied>>
 Disconnect == /\ phase \in {"connecting", "needs_observation", "observing", "ready", "stale", "checking", "acting", "uncertain", "observing_uncertain"} /\ phase' = "closing" /\ lastResult' = "none" /\ unresolved' = (unresolved \/ phase = "acting") /\ UNCHANGED <<resources, lateApplied, durable>>
 Closed == /\ phase = "closing" /\ phase' = "disconnected" /\ lastResult' = "none" /\ resources' = "none" /\ UNCHANGED <<unresolved, lateApplied, durable>>
 Shutdown == /\ phase \in {"connecting", "needs_observation", "observing", "ready", "stale", "checking", "acting", "uncertain", "observing_uncertain", "closing"} /\ phase' = "shutdown_closing" /\ lastResult' = "none" /\ unresolved' = (unresolved \/ phase = "acting") /\ UNCHANGED <<resources, lateApplied, durable>>
@@ -30,7 +31,7 @@ Stop == /\ phase = "disconnected" /\ phase' = "stopped" /\ lastResult' = "none" 
 Done == /\ phase = "stopped" /\ UNCHANGED vars
 Crash == /\ phase \notin {"disconnected", "stopped"} /\ phase' = "disconnected" /\ resources' = "none" /\ lastResult' = "none" /\ unresolved' = (unresolved \/ durable) /\ UNCHANGED <<lateApplied, durable>>
 CrashKeepsUncertainty == durable /\ phase = "disconnected" => unresolved
-Next == Crash \/ Connect \/ Connected \/ ConnectFailed \/ Observe \/ ObserveUncertain \/ ObserveSuccess \/ ObserveFailure \/ UncertainObservationDone \/ HeartbeatFailed \/ ObserveStale \/ CheckConnection \/ CheckFailed \/ Act \/ ActionAcknowledged \/ ActionTimeout \/ LateDelivery \/ DeliverySettled \/ Disconnect \/ Closed \/ Shutdown \/ ShutdownClosed \/ Stop \/ Done
+Next == Crash \/ Connect \/ Connected \/ ConnectFailed \/ Observe \/ ObserveUncertain \/ ObserveSuccess \/ ObserveFailure \/ UncertainObservationDone \/ HeartbeatFailed \/ ObserveStale \/ CheckConnection \/ CheckFailed \/ Act \/ ActionAcknowledged \/ ActionTimeout \/ LateDelivery \/ DeliverySettled \/ AcknowledgeDelivery \/ Disconnect \/ Closed \/ Shutdown \/ ShutdownClosed \/ Stop \/ Done
 Spec == Init /\ [][Next]_vars
 TypeOK == /\ phase \in Phases /\ lastResult \in Results /\ resources \in {"none", "owned"} /\ unresolved \in BOOLEAN /\ lateApplied \in BOOLEAN /\ durable \in BOOLEAN
 ReadyHasFreshImage == phase = "ready" => lastResult = "fresh" /\ ~unresolved

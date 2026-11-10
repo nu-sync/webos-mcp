@@ -15,7 +15,10 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use session::{Action, ActionReport, Observation, ObserveOptions};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use webos_mcp::metrics::{Metrics, Operation, Outcome};
+use webos_mcp::{
+    error::TvError,
+    metrics::{Metrics, Operation, Outcome},
+};
 
 #[derive(Clone)]
 struct TvServer {
@@ -89,20 +92,15 @@ fn observation_options(
     })
 }
 
-fn error_outcome(message: &str) -> Outcome {
-    if message.contains("timed out") || message.contains("timeout") {
-        Outcome::Timeout
-    } else {
-        Outcome::Failure
-    }
-}
+/// Encoded image bytes and their MIME type, as captured.
+type Image = (Vec<u8>, &'static str);
 
-fn tool_result(metadata: Value, image: Option<Vec<u8>>, failed: bool) -> CallToolResult {
+fn tool_result(metadata: Value, image: Option<Image>, failed: bool) -> CallToolResult {
     let mut content = Vec::new();
-    if let Some(image) = image {
+    if let Some((bytes, mime_type)) = image {
         content.push(ContentBlock::image(
-            base64::engine::general_purpose::STANDARD.encode(image),
-            "image/png",
+            base64::engine::general_purpose::STANDARD.encode(bytes),
+            mime_type,
         ));
     }
     content.push(ContentBlock::text(metadata.to_string()));
@@ -115,7 +113,7 @@ fn tool_result(metadata: Value, image: Option<Vec<u8>>, failed: bool) -> CallToo
     result
 }
 
-fn observation_content(observation: Observation) -> (Value, Vec<u8>) {
+fn observation_content(observation: Observation) -> (Value, Image) {
     let metadata = json!({
         "observation_id": observation.id,
         "visual_change": observation.visual_change,
@@ -129,7 +127,10 @@ fn observation_content(observation: Observation) -> (Value, Vec<u8>) {
         "elapsed_ms": observation.elapsed_ms,
         "returned_at_unix_ms": SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis(),
     });
-    (metadata, observation.image.png)
+    (
+        metadata,
+        (observation.image.bytes, observation.image.mime_type),
+    )
 }
 
 fn action_result(report: ActionReport) -> (CallToolResult, Outcome) {
@@ -141,8 +142,8 @@ fn action_result(report: ActionReport) -> (CallToolResult, Outcome) {
         None => (json!({}), None),
     };
     metadata["delivery"] = json!(report.delivery);
-    metadata["action_error"] = json!(report.error);
-    metadata["observation_error"] = json!(report.observation_error);
+    metadata["action_error"] = json!(report.error.map(TvError::message));
+    metadata["observation_error"] = json!(report.observation_error.map(TvError::message));
     metadata["do_not_repeat_action"] = json!(true);
     let failed = report.error.is_some()
         || report.observation_error.is_some()
@@ -152,7 +153,7 @@ fn action_result(report: ActionReport) -> (CallToolResult, Outcome) {
             .error
             .into_iter()
             .chain(report.observation_error)
-            .any(|error| error_outcome(error) == Outcome::Timeout)
+            .any(|error| error.outcome() == Outcome::Timeout)
         {
             Outcome::Timeout
         } else {
@@ -164,7 +165,8 @@ fn action_result(report: ActionReport) -> (CallToolResult, Outcome) {
     (tool_result(metadata, image, failed), outcome)
 }
 
-fn action_rejected(message: &'static str) -> CallToolResult {
+fn action_rejected(error: impl Into<TvError>) -> CallToolResult {
+    let message = error.into().message();
     tool_result(
         json!({"delivery":"not_sent", "action_error":message, "do_not_repeat_action":false}),
         None,
@@ -172,15 +174,15 @@ fn action_rejected(message: &'static str) -> CallToolResult {
     )
 }
 
-fn message_result(value: Result<&'static str, &'static str>) -> (CallToolResult, Outcome) {
+fn message_result(value: Result<&'static str, TvError>) -> (CallToolResult, Outcome) {
     match value {
         Ok(message) => (
             CallToolResult::success(vec![ContentBlock::text(message)]),
             Outcome::Success,
         ),
-        Err(message) => (
-            CallToolResult::error(vec![ContentBlock::text(message)]),
-            error_outcome(message),
+        Err(error) => (
+            CallToolResult::error(vec![ContentBlock::text(error.message())]),
+            error.outcome(),
         ),
     }
 }
@@ -196,7 +198,7 @@ impl TvServer {
     }
 
     #[tool(
-        description = "Capture a fresh TV image and observation ID, optionally waiting for pixel changes. A change or delay does not prove the UI settled."
+        description = "Capture a fresh TV image (JPEG by default) and observation ID, optionally waiting for pixel changes. A change or delay does not prove the UI settled."
     )]
     async fn tv_observe(&self, Parameters(params): Parameters<ObserveParams>) -> CallToolResult {
         let measurement = self.metrics.begin(Operation::Observe);
@@ -214,8 +216,8 @@ impl TvServer {
                 tool_result(metadata, Some(image), false)
             }
             Err(error) => {
-                measurement.finish(error_outcome(error));
-                tool_result(json!({"observation_error":error}), None, true)
+                measurement.finish(error.outcome());
+                tool_result(json!({"observation_error":error.message()}), None, true)
             }
         }
     }
@@ -262,7 +264,7 @@ impl TvServer {
             .await;
         let (result, outcome) = match response {
             Ok(report) => action_result(report),
-            Err(error) => (action_rejected(error), error_outcome(error)),
+            Err(error) => (action_rejected(error), error.outcome()),
         };
         measurement.finish(outcome);
         result
@@ -300,7 +302,7 @@ impl TvServer {
             .await;
         let (result, outcome) = match response {
             Ok(report) => action_result(report),
-            Err(error) => (action_rejected(error), error_outcome(error)),
+            Err(error) => (action_rejected(error), error.outcome()),
         };
         measurement.finish(outcome);
         result
@@ -364,7 +366,7 @@ mod tests {
             delivery: Delivery::Sent,
             error: None,
             observation: None,
-            observation_error: Some("capture_timeout"),
+            observation_error: Some(TvError::timeout("Capture timed out")),
         });
         assert_eq!(result.is_error, Some(true));
         assert_eq!(outcome, Outcome::Timeout);
@@ -377,7 +379,7 @@ mod tests {
         let metadata = result.structured_content.unwrap();
         assert_eq!(metadata["delivery"], "sent");
         assert_eq!(metadata["action_error"], Value::Null);
-        assert_eq!(metadata["observation_error"], "capture_timeout");
+        assert_eq!(metadata["observation_error"], "Capture timed out");
         assert_eq!(metadata["do_not_repeat_action"], true);
         assert!(metadata.get("observation_id").is_none());
     }
@@ -386,7 +388,7 @@ mod tests {
     fn uncertain_action_cannot_be_rendered_as_a_safe_rejection() {
         let (result, outcome) = action_result(ActionReport {
             delivery: Delivery::Unknown,
-            error: Some("Button delivery is uncertain"),
+            error: Some(TvError::failure("Button delivery is uncertain")),
             observation: None,
             observation_error: None,
         });
@@ -405,7 +407,8 @@ mod tests {
             error: None,
             observation: Some(Observation {
                 image: webos_mcp::capture::CapturedImage {
-                    png: vec![1, 2, 3],
+                    bytes: vec![1, 2, 3],
+                    mime_type: "image/jpeg",
                     all_black: false,
                     fingerprint: [0; 32],
                     width: 1,
@@ -424,7 +427,7 @@ mod tests {
         assert_ne!(result.is_error, Some(true));
         let image = result.content[0].as_image().unwrap();
         assert_eq!(image.data, "AQID");
-        assert_eq!(image.mime_type, "image/png");
+        assert_eq!(image.mime_type, "image/jpeg");
         let metadata = result.structured_content.unwrap();
         assert_eq!(metadata["observation_id"], "synthetic-session-2");
         assert_eq!(metadata["visual_change"], "changed");

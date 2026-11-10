@@ -317,7 +317,10 @@ fn validates_full_png_and_preserves_low_bits_of_sixteen_bit_color() {
         png::BitDepth::Sixteen,
         &[0, 1, 0, 0, 0, 0],
     );
-    assert!(!decode_image(image.clone()).unwrap().all_black);
+    let decoded = decode_image(image.clone()).unwrap();
+    assert!(!decoded.all_black);
+    assert_eq!(decoded.mime_type, "image/png");
+    assert_eq!(decoded.bytes, image);
     assert!(matches!(
         decode_image(image[..image.len() - 8].to_vec()),
         Err(CaptureError::InvalidImage)
@@ -337,14 +340,22 @@ fn validates_full_png_and_preserves_low_bits_of_sixteen_bit_color() {
 }
 
 #[test]
-fn jpeg_capture_is_validated_and_returned_as_png() {
+fn jpeg_capture_is_validated_and_returned_without_reencoding() {
     let mut jpeg = Vec::new();
     image::codecs::jpeg::JpegEncoder::new(&mut jpeg)
         .encode(&[255, 0, 0], 1, 1, image::ExtendedColorType::Rgb8)
         .unwrap();
     let frame = decode_image(jpeg.clone()).unwrap();
     assert_eq!((frame.width, frame.height, frame.all_black), (1, 1, false));
-    assert!(frame.png.starts_with(b"\x89PNG\r\n\x1a\n"));
+    assert_eq!(frame.mime_type, "image/jpeg");
+    assert_eq!(frame.bytes, jpeg);
+    let mut black = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new(&mut black)
+        .encode(&[0; 12], 2, 2, image::ExtendedColorType::Rgb8)
+        .unwrap();
+    let black = decode_image(black).unwrap();
+    assert!(black.all_black);
+    assert_ne!(black.fingerprint, frame.fingerprint);
     assert!(matches!(
         decode_image(jpeg[..jpeg.len() - 2].to_vec()),
         Err(CaptureError::InvalidImage)
@@ -454,4 +465,50 @@ async fn authentication_failure_does_not_hide_unconfirmed_cleanup() {
         Err(CaptureError::CleanupUnconfirmed)
     ));
     assert_eq!(script.lock().unwrap().calls, ["connect", "close"]);
+}
+
+#[test]
+fn agent_candidates_prefer_the_configured_path_then_the_environment() {
+    let both = agent_candidates(" /configured ", Some("/environment".into()));
+    assert_eq!(both[..2], ["/configured", "/environment"]);
+    let unset = agent_candidates("", Some("/environment".into()));
+    assert_eq!(unset[0], "/environment");
+    let same = agent_candidates("/same", Some("/same".into()));
+    assert_eq!(same.iter().filter(|path| *path == "/same").count(), 1);
+    #[cfg(not(windows))]
+    assert!(agent_candidates(" ", None).is_empty());
+}
+
+#[tokio::test]
+async fn a_stale_agent_path_falls_back_to_the_next_candidate_once() {
+    let tried = RefCell::new(Vec::new());
+    let agent = connect_agent(
+        vec!["stale".into(), "live".into(), "unused".into()],
+        async |path| {
+            tried.borrow_mut().push(path.clone());
+            (path == "live").then_some(path)
+        },
+    )
+    .await;
+    assert_eq!(agent, Ok("live".to_owned()));
+    assert_eq!(*tried.borrow(), ["stale", "live"]);
+    let none = connect_agent(vec!["stale".into()], async |_| None::<()>).await;
+    assert_eq!(none, Err(CaptureError::Connection));
+}
+
+#[test]
+fn capture_timeout_is_typed_as_a_timeout_outcome() {
+    use crate::metrics::Outcome;
+    assert_eq!(
+        TvError::from(CaptureError::Timeout).outcome(),
+        Outcome::Timeout
+    );
+    assert_eq!(
+        TvError::from(CaptureError::Transfer).outcome(),
+        Outcome::Failure
+    );
+    assert_eq!(
+        TvError::from(CaptureError::Timeout).message(),
+        CaptureError::Timeout.message()
+    );
 }

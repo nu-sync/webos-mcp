@@ -1,5 +1,25 @@
 # Verification status
 
+## Review fixes — November 10, 2026
+
+None of the changes in this section has been exercised on a real TV. Everything below is from unit tests, loopback endpoints, a synthetic benchmark, and TLC.
+
+**JPEG is returned as captured.** The default path previously decoded the TV's JPEG, encoded a PNG, and decoded that PNG again. It now decodes once to validate and fingerprint the pixels and returns the original bytes as `image/jpeg`; lossless capture still returns `image/png`. Decoding runs on a blocking thread. A release-build benchmark of the host image pipeline on macOS used three synthetic 1920×1080 images and nine runs each: the old pipeline took a median 34 ms, 222 ms, and 198 ms for flat, lightly noisy, and heavily noisy content, and the new one 13 ms, 14 ms, and 16 ms. The returned image shrank from 93 KB, 1,011 KB, and 2,376 KB to 91 KB, 168 KB, and 487 KB. Synthetic content is not a TV screen, the benchmark excludes SSH and the TV, and the `image_validation` stage on a real screen has not been remeasured. Fingerprints are computed from the same decoded pixels and tags as before. Clients now receive a different MIME type by default.
+
+**Transport.** The input socket reuses the control socket's pinned TLS configuration, the two preflight pings run concurrently, and TCP_NODELAY is set. A loopback test shows the second socket resumes the TLS session and a separately configured one does not. Whether the TV accepts resumption, and any latency effect, is unmeasured. Enabling thin LTO with one codegen unit did not change the benchmark's decode time (12.4 ms versus 12.5 ms median on flat content), so no release profile was added.
+
+**Typed outcomes.** Errors now carry whether they timed out. Previously a metrics outcome was guessed from the words "timed out" or "timeout" in the message, so a preflight or button-send timeout was counted as a failure. Tests cover the constructor-based classification.
+
+**Marker.** A failed pending-marker write previously left the session reporting unresolved delivery although nothing was sent. It now sends nothing, restores a clear marker when it can, and requires a new observation; a regression test uses an unwritable marker path. Per-action marker updates sync the file only; the directory entry is synced once when the marker is loaded at connect. One marker write with both syncs measured about 4 ms on the same Mac.
+
+**Leaving blocked states.** `webos-mcp acknowledge-delivery` clears an unresolved delivery after typed confirmation from a person, outside MCP and only while holding the session lock. A unit test covers declined, failed, confirmed, and nothing-to-clear cases against a temporary marker; the interactive prompt itself was not run against a real unresolved action. Unconfirmed cleanup still stays in `Closing`, and the error now states that restarting the server is the way out instead of suggesting another disconnect. The session model gained `AcknowledgeDelivery`; TLC reached 37 states and 144 steps with all eight invariants and the deadlock check passing, and both negative controls still detected their faults.
+
+**SSH agent path.** Capture tries the saved agent socket and then `SSH_AUTH_SOCK`; setup accepts an empty agent path to mean the environment's. Tests cover candidate order and fallback with a fake connector. No real agent, reboot, or Windows pipe was exercised.
+
+**Dependencies.** `cargo deny check` passes with `rmcp` updated to 3.9.0 for RUSTSEC-2026-0462, which affects HTTP clients this server does not use. RUSTSEC-2023-0071 in `rsa` is ignored with a recorded reason: no fixed release exists and this program performs no RSA private-key operations.
+
+The capture script still writes JPEG data to a file named `screen.png` on the TV. Renaming it was left alone because the compositor's handling of other names is untested.
+
 ## Faster capture — November 8, 2026
 
 On the configured rooted TV and macOS, five alternating captures of the same Home screen per optimized binary returned full-resolution PNGs through the MCP. The native-PNG baseline median was 1.64 seconds (1.60–1.67 seconds); JPEG capture decoded and encoded as PNG on the host had a 0.28-second median (0.27–0.28 seconds). These are MCP observation timings after connecting, excluding model reasoning; clients connected and disconnected between samples. The capture images were visually inspected, and all ten calls succeeded. On the TV, five native-PNG captures took 1.39–1.49 seconds versus 0.10–0.11 seconds for JPEG, establishing compositor image generation as the main difference for this screen. Results will vary with screen content and device. JPEG is lossy; `WEBOS_MCP_LOSSLESS=1` requests native PNG instead.

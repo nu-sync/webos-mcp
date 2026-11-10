@@ -12,6 +12,7 @@ use std::{
 use tokio::sync::Mutex;
 use webos_mcp::{
     capture::{CaptureConfig, CapturedImage, RecoveringCapture},
+    error::{TvError, outcome},
     metrics::{Metrics, Operation, Outcome, Stage},
     transport::{self, AuthenticatedSocket},
 };
@@ -23,27 +24,27 @@ pub(crate) fn diagnostic(stage: &'static str) {
 }
 
 pub trait Device: Send {
-    fn probe(&mut self) -> impl std::future::Future<Output = Result<(), &'static str>> + Send;
+    fn probe(&mut self) -> impl std::future::Future<Output = Result<(), TvError>> + Send;
     fn send(
         &mut self,
         action: &Action,
-    ) -> impl std::future::Future<Output = Result<(), &'static str>> + Send;
+    ) -> impl std::future::Future<Output = Result<(), TvError>> + Send;
     fn capture(
         &mut self,
-    ) -> impl std::future::Future<Output = Result<CapturedImage, &'static str>> + Send;
+    ) -> impl std::future::Future<Output = Result<CapturedImage, TvError>> + Send;
     fn capture_with_metrics(
         &mut self,
         op: Operation,
         metrics: &Metrics,
-    ) -> impl std::future::Future<Output = Result<CapturedImage, &'static str>> + Send {
+    ) -> impl std::future::Future<Output = Result<CapturedImage, TvError>> + Send {
         async move {
             let measurement = metrics.stage(op, Stage::CaptureRequest);
             let result = self.capture().await;
-            measurement.finish(result_outcome(&result));
+            measurement.finish(outcome(&result));
             result
         }
     }
-    fn close(&mut self) -> impl std::future::Future<Output = Result<(), &'static str>> + Send;
+    fn close(&mut self) -> impl std::future::Future<Output = Result<(), TvError>> + Send;
 }
 
 pub struct LiveDevice {
@@ -58,7 +59,7 @@ impl LiveDevice {
         endpoint: SocketAddr,
         fingerprint: [u8; 32],
         metrics: &Metrics,
-    ) -> Result<(), &'static str> {
+    ) -> Result<(), TvError> {
         self.cleanup_unconfirmed = true;
         let remote = transport::connect(endpoint, fingerprint, metrics).await;
         // A completed failed handshake drops its local socket. Cancellation does
@@ -69,19 +70,15 @@ impl LiveDevice {
     }
 }
 impl Device for LiveDevice {
-    async fn probe(&mut self) -> Result<(), &'static str> {
-        self.input
-            .as_mut()
-            .ok_or("TV input is unavailable")?
-            .probe()
-            .await?;
-        self.remote
-            .as_mut()
-            .ok_or("TV control is unavailable")?
-            .probe()
-            .await
+    async fn probe(&mut self) -> Result<(), TvError> {
+        let input = self.input.as_mut().ok_or("TV input is unavailable")?;
+        let remote = self.remote.as_mut().ok_or("TV control is unavailable")?;
+        // The sockets are independent; check both in one round trip.
+        let (input, remote) = tokio::join!(input.probe(), remote.probe());
+        input?;
+        remote
     }
-    async fn send(&mut self, action: &Action) -> Result<(), &'static str> {
+    async fn send(&mut self, action: &Action) -> Result<(), TvError> {
         match action {
             Action::Press { button, count } => {
                 for i in 0..*count {
@@ -105,27 +102,27 @@ impl Device for LiveDevice {
             }
         }
     }
-    async fn capture(&mut self) -> Result<CapturedImage, &'static str> {
+    async fn capture(&mut self) -> Result<CapturedImage, TvError> {
         self.capture
             .as_mut()
             .ok_or("Visual capture is unavailable")?
             .capture()
             .await
-            .map_err(|e| e.message())
+            .map_err(TvError::from)
     }
     async fn capture_with_metrics(
         &mut self,
         op: Operation,
         metrics: &Metrics,
-    ) -> Result<CapturedImage, &'static str> {
+    ) -> Result<CapturedImage, TvError> {
         self.capture
             .as_mut()
             .ok_or("Visual capture is unavailable")?
             .capture_with_metrics(op, metrics)
             .await
-            .map_err(|e| e.message())
+            .map_err(TvError::from)
     }
-    async fn close(&mut self) -> Result<(), &'static str> {
+    async fn close(&mut self) -> Result<(), TvError> {
         let prior_uncertainty = self.cleanup_unconfirmed;
         self.cleanup_unconfirmed = true;
         let input = match self.input.take() {
@@ -137,11 +134,23 @@ impl Device for LiveDevice {
             None => Ok(()),
         };
         let capture = match self.capture.as_mut() {
-            Some(s) => s.close().await.map_err(|e| e.message()),
+            Some(s) => s.close().await.map_err(TvError::from),
             None => Ok(()),
         };
         if prior_uncertainty || input.is_err() || remote.is_err() || capture.is_err() {
-            return Err("TV cleanup could not be confirmed");
+            // The sockets are gone and the flag never clears, so only a new
+            // process can release this session. Say so instead of implying a
+            // later disconnect could succeed.
+            let message =
+                "TV cleanup could not be confirmed; restart the MCP server before reconnecting";
+            let timed_out = [input, remote, capture]
+                .iter()
+                .any(|closed| outcome(closed) == Outcome::Timeout);
+            return Err(if timed_out {
+                TvError::timeout(message)
+            } else {
+                TvError::failure(message)
+            });
         }
         self.cleanup_unconfirmed = false;
         Ok(())
@@ -235,10 +244,12 @@ pub enum Delivery {
 }
 pub struct ActionReport {
     pub delivery: Delivery,
-    pub error: Option<&'static str>,
+    pub error: Option<TvError>,
     pub observation: Option<Observation>,
-    pub observation_error: Option<&'static str>,
+    pub observation_error: Option<TvError>,
 }
+const UNRESOLVED: &str = "An earlier action has unresolved delivery; actions are blocked until the user checks the TV and runs `webos-mcp acknowledge-delivery`";
+
 fn observation_id() -> Result<String, &'static str> {
     let mut bytes = [0u8; 16];
     rustls::crypto::ring::default_provider()
@@ -246,13 +257,6 @@ fn observation_id() -> Result<String, &'static str> {
         .fill(&mut bytes)
         .map_err(|_| "Could not create observation ID")?;
     Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
-}
-fn result_outcome<T>(result: &Result<T, &'static str>) -> Outcome {
-    match result {
-        Ok(_) => Outcome::Success,
-        Err(error) if error.contains("timed out") || error.contains("timeout") => Outcome::Timeout,
-        Err(_) => Outcome::Failure,
-    }
 }
 fn state_dir() -> Result<PathBuf, &'static str> {
     let path = directories::ProjectDirs::from("", "", "webos-mcp")
@@ -271,6 +275,20 @@ fn read_marker(path: &Path) -> Result<Option<bool>, &'static str> {
     }
 }
 
+/// Make the marker's directory entry durable. Needed once after the file is
+/// created, not on every one-byte update of an existing file.
+fn sync_marker_directory(path: &Path) -> Result<(), &'static str> {
+    #[cfg(unix)]
+    File::open(path.parent().ok_or("Local action state is unavailable")?)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|_| "Could not save local action state")?;
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
+/// Durably update the marker's content. The caller must already have made the
+/// file's directory entry durable through `load_or_migrate_marker`.
 fn write_marker(path: &Path, pending: bool) -> Result<(), &'static str> {
     let mut file = OpenOptions::new()
         .read(true)
@@ -284,10 +302,6 @@ fn write_marker(path: &Path, pending: bool) -> Result<(), &'static str> {
     file.set_len(1)
         .map_err(|_| "Could not save local action state")?;
     file.sync_all()
-        .map_err(|_| "Could not save local action state")?;
-    #[cfg(unix)]
-    File::open(path.parent().ok_or("Local action state is unavailable")?)
-        .and_then(|directory| directory.sync_all())
         .map_err(|_| "Could not save local action state")?;
     file.seek(SeekFrom::Start(0))
         .map_err(|_| "Could not verify local action state")?;
@@ -318,12 +332,54 @@ fn load_or_migrate_marker(
     path: &Path,
     legacy: impl FnOnce() -> Result<bool, &'static str>,
 ) -> Result<bool, &'static str> {
-    if let Some(pending) = read_marker(path)? {
-        return Ok(pending);
-    }
-    let pending = legacy()?;
-    write_marker(path, pending)?;
+    let pending = match read_marker(path)? {
+        Some(pending) => pending,
+        None => {
+            let pending = legacy()?;
+            write_marker(path, pending)?;
+            pending
+        }
+    };
+    // Once per load, so later one-byte updates need only sync the file.
+    sync_marker_directory(path)?;
     Ok(pending)
+}
+
+/// Clear the durable delivery guard after the user has checked the TV.
+///
+/// This is the only path that clears an unresolved delivery, and it is never
+/// reachable from an MCP tool: the server cannot observe whether a late button
+/// could still arrive, so a person has to accept that risk explicitly. The
+/// caller must hold the session lock so no connected session is using the
+/// marker.
+pub fn acknowledge_delivery(
+    _lock: &File,
+    confirmed: impl FnOnce() -> Result<bool, &'static str>,
+) -> Result<Acknowledgement, &'static str> {
+    acknowledge_marker(&state_dir()?.join("action-state"), unresolved()?, confirmed)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum Acknowledgement {
+    NothingUnresolved,
+    Declined,
+    Cleared,
+}
+
+fn acknowledge_marker(
+    path: &Path,
+    pending: bool,
+    confirmed: impl FnOnce() -> Result<bool, &'static str>,
+) -> Result<Acknowledgement, &'static str> {
+    if !pending {
+        return Ok(Acknowledgement::NothingUnresolved);
+    }
+    if !confirmed()? {
+        return Ok(Acknowledgement::Declined);
+    }
+    write_marker(path, false)?;
+    sync_marker_directory(path)?;
+    Ok(Acknowledgement::Cleared)
 }
 pub fn acquire_lock() -> Result<File, &'static str> {
     let lock = OpenOptions::new()
@@ -345,12 +401,14 @@ impl SessionOwner<LiveDevice> {
             metrics,
         }
     }
-    pub async fn connect(&self) -> Result<&'static str, &'static str> {
+    pub async fn connect(&self) -> Result<&'static str, TvError> {
         let _request = self.requests.try_lock().map_err(|_| "TV session is busy")?;
         let mut state = self.state.lock().await;
         match &mut *state {
             State::Closing(_) => {
-                return Err("TV cleanup is incomplete; disconnect before reconnecting");
+                return Err(TvError::failure(
+                    "TV cleanup is incomplete; call tv_disconnect, and restart the MCP server if it cannot confirm cleanup",
+                ));
             }
             State::Connected(s) => {
                 if !s.healthy || s.device.probe().await.is_err() {
@@ -358,7 +416,9 @@ impl SessionOwner<LiveDevice> {
                     if s.view != View::Uncertain {
                         s.view = View::NeedsObservation;
                     }
-                    return Err("TV connection is stale; disconnect, reconnect and observe again");
+                    return Err(TvError::failure(
+                        "TV connection is stale; disconnect, reconnect and observe again",
+                    ));
                 }
                 return Ok("TV is already connected");
             }
@@ -370,7 +430,7 @@ impl SessionOwner<LiveDevice> {
             .metrics
             .stage(Operation::Connect, Stage::CredentialLookup);
         let loaded = setup::load_device_credentials();
-        measurement.finish(result_outcome(&loaded));
+        measurement.finish(outcome(&loaded));
         let (address, mut credentials) = loaded?;
         let endpoint = SocketAddr::new(address, 3001);
         // Setup owns its resources in `Closing` until `finish_setup` resolves it.
@@ -396,7 +456,7 @@ impl SessionOwner<LiveDevice> {
             .await;
         let has_capture = state.finish_setup(established).await?;
         Ok(if pending {
-            "Connected; an earlier action has unresolved delivery. Actions are blocked."
+            "Connected; an earlier action has unresolved delivery. Actions are blocked until the user checks the TV and runs `webos-mcp acknowledge-delivery` outside this session."
         } else if has_capture {
             "Connected; capture is configured. Observe before acting."
         } else {
@@ -409,7 +469,7 @@ impl SessionOwner<LiveDevice> {
         endpoint: SocketAddr,
         address: std::net::IpAddr,
         credentials: &mut setup::Credentials,
-    ) -> Result<bool, &'static str> {
+    ) -> Result<bool, TvError> {
         let State::Closing(s) = state else {
             unreachable!()
         };
@@ -420,7 +480,7 @@ impl SessionOwner<LiveDevice> {
             .device
             .connect_control(endpoint, credentials.fingerprint, &self.metrics)
             .await;
-        measurement.finish(result_outcome(&remote));
+        measurement.finish(outcome(&remote));
         remote?;
         let measurement = self.metrics.stage(Operation::Connect, Stage::Registration);
         let key = transport::register(
@@ -428,7 +488,7 @@ impl SessionOwner<LiveDevice> {
             Some(&credentials.client_key),
         )
         .await;
-        measurement.finish(result_outcome(&key));
+        measurement.finish(outcome(&key));
         setup::persist_verified_credentials(credentials, address, key?)?;
         s.device.cleanup_unconfirmed = true;
         let measurement = self
@@ -439,9 +499,9 @@ impl SessionOwner<LiveDevice> {
             .remote
             .as_mut()
             .unwrap()
-            .input_socket(endpoint, credentials.fingerprint, &self.metrics)
+            .input_socket(endpoint, &self.metrics)
             .await;
-        measurement.finish(result_outcome(&input));
+        measurement.finish(outcome(&input));
         s.device.cleanup_unconfirmed = false;
         s.device.input = Some(input?);
         if let Some(config) = credentials.ssh.take() {
@@ -458,7 +518,7 @@ impl SessionOwner<LiveDevice> {
             {
                 s.device.cleanup_unconfirmed = false;
             }
-            s.device.capture = Some(capture.map_err(|e| e.message())?);
+            s.device.capture = Some(capture?);
             s.device.cleanup_unconfirmed = false;
         }
         Ok(s.device.capture.is_some())
@@ -469,10 +529,7 @@ impl<D: Device> State<D> {
     /// Resolve a setup attempt that ran to completion. A known failure releases
     /// what it owns and returns to `Disconnected` only when cleanup is confirmed.
     /// A cancelled setup never reaches this and stays `Closing`.
-    async fn finish_setup<T>(
-        &mut self,
-        result: Result<T, &'static str>,
-    ) -> Result<T, &'static str> {
+    async fn finish_setup<T>(&mut self, result: Result<T, TvError>) -> Result<T, TvError> {
         let State::Closing(s) = self else {
             unreachable!()
         };
@@ -521,7 +578,7 @@ impl<D: Device + 'static> SessionOwner<D> {
         options: ObserveOptions,
         metrics: &Metrics,
         op: Operation,
-    ) -> Result<Observation, &'static str> {
+    ) -> Result<Observation, TvError> {
         let started = Instant::now();
         let uncertain = s.view == View::Uncertain;
         if !uncertain {
@@ -578,15 +635,15 @@ impl<D: Device + 'static> SessionOwner<D> {
             elapsed_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
         })
     }
-    pub async fn observe(&self, options: ObserveOptions) -> Result<Observation, &'static str> {
+    pub async fn observe(&self, options: ObserveOptions) -> Result<Observation, TvError> {
         let _request = self.requests.try_lock().map_err(|_| "TV session is busy")?;
         let mut state = self.state.lock().await;
         match &mut *state {
             State::Connected(s) => {
                 Self::observe_locked(s, options, &self.metrics, Operation::Observe).await
             }
-            State::Closing(_) => Err("TV cleanup is incomplete"),
-            State::Disconnected => Err("TV is disconnected"),
+            State::Closing(_) => Err(TvError::failure("TV cleanup is incomplete")),
+            State::Disconnected => Err(TvError::failure("TV is disconnected")),
         }
     }
     pub async fn act(
@@ -594,42 +651,52 @@ impl<D: Device + 'static> SessionOwner<D> {
         action: Action,
         id: &str,
         observe: Option<ObserveOptions>,
-    ) -> Result<ActionReport, &'static str> {
+    ) -> Result<ActionReport, TvError> {
         let _request = self.requests.try_lock().map_err(|_| "TV session is busy")?;
         let mut state = self.state.lock().await;
         let s = match &mut *state {
             State::Connected(s) => s,
-            State::Closing(_) => return Err("TV cleanup is incomplete"),
-            State::Disconnected => return Err("TV is disconnected"),
+            State::Closing(_) => return Err(TvError::failure("TV cleanup is incomplete")),
+            State::Disconnected => return Err(TvError::failure("TV is disconnected")),
         };
         match &s.view {
             View::Fresh(current) if current == id => {}
-            View::Fresh(_) => return Err("Observation ID is stale; observe before acting"),
-            View::NeedsObservation => return Err("Observe the TV before an action"),
-            View::Uncertain => {
-                return Err(
-                    "An earlier action has unresolved delivery; further actions are blocked",
-                );
+            View::Fresh(_) => {
+                return Err(TvError::failure(
+                    "Observation ID is stale; observe before acting",
+                ));
             }
+            View::NeedsObservation => {
+                return Err(TvError::failure("Observe the TV before an action"));
+            }
+            View::Uncertain => return Err(TvError::failure(UNRESOLVED)),
         }
         if !s.healthy {
-            return Err("TV connection is stale; disconnect, reconnect and observe again");
+            return Err(TvError::failure(
+                "TV connection is stale; disconnect, reconnect and observe again",
+            ));
         }
         s.view = View::NeedsObservation;
         let op = action.operation();
         let measurement = self.metrics.stage(op, Stage::InputConnection);
         let probe = s.device.probe().await;
-        measurement.finish(result_outcome(&probe));
+        measurement.finish(outcome(&probe));
         if let Err(error) = probe {
             s.healthy = false;
             return Err(error);
         }
         // Persist before any send; cancellation after this point blocks further actions.
+        if let Err(error) = write_marker(&s.marker, true) {
+            // Nothing was sent, so this session stays usable after a new
+            // observation. The file may still hold a pending byte; restore it
+            // when possible, and otherwise a restart fails closed.
+            let _ = write_marker(&s.marker, false);
+            return Err(error.into());
+        }
         s.view = View::Uncertain;
-        write_marker(&s.marker, true)?;
         let measurement = self.metrics.stage(op, Stage::CommandDelivery);
         let sent = s.device.send(&action).await;
-        measurement.finish(result_outcome(&sent));
+        measurement.finish(outcome(&sent));
         if let Err(error) = sent {
             return Ok(ActionReport {
                 delivery: Delivery::Unknown,
@@ -641,7 +708,7 @@ impl<D: Device + 'static> SessionOwner<D> {
         if let Err(error) = write_marker(&s.marker, false) {
             return Ok(ActionReport {
                 delivery: Delivery::Unknown,
-                error: Some(error),
+                error: Some(error.into()),
                 observation: None,
                 observation_error: None,
             });
@@ -661,7 +728,7 @@ impl<D: Device + 'static> SessionOwner<D> {
             observation_error,
         })
     }
-    pub async fn disconnect(&self) -> Result<&'static str, &'static str> {
+    pub async fn disconnect(&self) -> Result<&'static str, TvError> {
         let _request = self.requests.try_lock().map_err(|_| "TV session is busy")?;
         let mut state = self.state.lock().await;
         if matches!(&*state, State::Disconnected) {
@@ -680,7 +747,7 @@ impl<D: Device + 'static> SessionOwner<D> {
             .metrics
             .stage(Operation::Disconnect, Stage::ConnectionCleanup);
         let closed = s.device.close().await;
-        measurement.finish(result_outcome(&closed));
+        measurement.finish(outcome(&closed));
         closed?;
         *state = State::Disconnected;
         Ok("TV disconnected")

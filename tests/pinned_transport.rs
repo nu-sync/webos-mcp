@@ -99,10 +99,13 @@ async fn verified_certificate_allows_websocket_connection() {
 async fn changed_certificate_stops_before_websocket_or_registration() {
     let (endpoint, mut pin, server) = simulated_tv(false, false).await;
     pin[0] ^= 1;
-    assert!(matches!(
-        transport::connect(endpoint, pin, &Metrics::new(false)).await,
-        Err("TV TLS authentication failed")
-    ));
+    assert_eq!(
+        transport::connect(endpoint, pin, &Metrics::new(false))
+            .await
+            .err()
+            .unwrap(),
+        "TV TLS authentication failed"
+    );
     assert!(!server.await.unwrap());
 }
 
@@ -128,10 +131,9 @@ async fn preflight_detects_a_closed_socket_before_any_action() {
         .await
         .unwrap();
     assert!(server.await.unwrap());
-    assert!(matches!(
-        socket.probe().await,
-        Err("TV connection is stale; reconnect and observe again")
-    ));
+    let stale = socket.probe().await.unwrap_err();
+    assert_eq!(stale, "TV connection is stale; reconnect and observe again");
+    assert_eq!(stale.outcome(), webos_mcp::metrics::Outcome::Failure);
 }
 
 #[tokio::test]

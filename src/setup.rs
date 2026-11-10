@@ -261,7 +261,7 @@ pub async fn setup(re_pair: bool) -> Result<(), &'static str> {
             let mut socket =
                 transport::connect(SocketAddr::new(address, 3001), pin, &Metrics::new(false))
                     .await?;
-            transport::register(&mut socket, key.as_deref()).await
+            Ok(transport::register(&mut socket, key.as_deref()).await?)
         },
         |record| save_credentials(record, true),
     )
@@ -293,6 +293,9 @@ pub async fn setup(re_pair: bool) -> Result<(), &'static str> {
     if port == 0 {
         return Err("Invalid SSH port.");
     }
+    eprintln!(
+        "Enter an SSH agent socket or pipe, or press Enter to use SSH_AUTH_SOCK from the server's environment each time it connects."
+    );
     let agent_socket = rpassword::prompt_password("SSH agent socket or pipe: ")
         .map_err(|_| "Could not read input from a terminal.")?;
     let public_key_path = rpassword::prompt_password("SSH public key file: ")
@@ -329,6 +332,36 @@ fn remove() -> Result<(), &'static str> {
         "Local TV address and credentials removed. TV-side authorization must be revoked separately. Any unresolved action remains blocked."
     );
     Ok(())
+}
+
+/// Clear an unresolved delivery only on the user's explicit, informed say-so.
+/// This runs outside the MCP protocol so an agent cannot unblock itself.
+fn acknowledge_delivery() -> Result<(), &'static str> {
+    use crate::session::Acknowledgement;
+    let lock = crate::session::acquire_lock()?;
+    let outcome = crate::session::acknowledge_delivery(&lock, || {
+        eprintln!(
+            "An earlier TV action was sent or interrupted without confirmation. It may have been\napplied, may never arrive, or could still arrive late; this tool cannot tell which.\n\nLook at the TV. If its current state is acceptable and you accept that the earlier\naction will not be retried or undone, type `acknowledge` and press Enter."
+        );
+        let mut answer = String::new();
+        std::io::stdin()
+            .read_line(&mut answer)
+            .map_err(|_| "Could not read the confirmation; actions remain blocked.")?;
+        Ok(answer.trim() == "acknowledge")
+    })?;
+    match outcome {
+        Acknowledgement::NothingUnresolved => {
+            println!("No action delivery is unresolved; nothing was changed.");
+            Ok(())
+        }
+        Acknowledgement::Declined => Err("Not acknowledged; actions remain blocked."),
+        Acknowledgement::Cleared => {
+            println!(
+                "Unresolved delivery acknowledged. Reconnect and observe the TV before the next action."
+            );
+            Ok(())
+        }
+    }
 }
 
 async fn migrate_local() -> Result<(), &'static str> {
@@ -432,6 +465,10 @@ pub async fn run_cli() -> Result<bool, &'static str> {
             remove()?;
             Ok(true)
         }
+        (Some(command), None) if command == "acknowledge-delivery" => {
+            acknowledge_delivery()?;
+            Ok(true)
+        }
         (Some(command), None) if command == "use-local-file" => {
             migrate_local().await?;
             Ok(true)
@@ -444,11 +481,13 @@ pub async fn run_cli() -> Result<bool, &'static str> {
         }
         (Some(command), None) if command == "--help" || command == "-h" => {
             println!(
-                "Usage: webos-mcp [setup [--re-pair] | use-local-file | remove]\n\nRun without arguments to start the MCP stdio server.\nRun use-local-file to copy existing paired credentials into an unencrypted local file."
+                "Usage: webos-mcp [setup [--re-pair] | use-local-file | acknowledge-delivery | remove]\n\nRun without arguments to start the MCP stdio server.\nRun use-local-file to copy existing paired credentials into an unencrypted local file.\nRun acknowledge-delivery after checking the TV to unblock actions following an unresolved delivery."
             );
             Ok(true)
         }
-        _ => Err("Usage: webos-mcp [setup [--re-pair] | use-local-file | remove]"),
+        _ => Err(
+            "Usage: webos-mcp [setup [--re-pair] | use-local-file | acknowledge-delivery | remove]",
+        ),
     }
 }
 

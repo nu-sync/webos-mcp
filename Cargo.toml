@@ -8,7 +8,7 @@ repository = "https://github.com/nu-sync/webos-mcp"
 description = "A local MCP server for visually navigating LG webOS TVs"
 
 [dependencies]
-rmcp = { version = "3.8.0", features = ["transport-io", "schemars"] }
+rmcp = { version = "3.9.0", features = ["transport-io", "schemars"] }
 keyring = { version = "3.6.3", features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust", "vendored"] }
 rpassword = "7"
 schemars = "1"
@@ -31,6 +31,6 @@ image = { version = "0.25.10", default-features = false, features = ["jpeg"] }
 
 [dev-dependencies]
 rcgen = "0.14"
-rmcp = { version = "3.8.0", features = ["client", "transport-child-process"] }
+rmcp = { version = "3.9.0", features = ["client", "transport-child-process"] }
 tempfile = "3"
 tokio = { version = "1", features = ["process", "time", "io-util"] }

@@ -1,5 +1,7 @@
 //! Optional rooted compositor capture over an existing trusted SSH identity.
-use crate::metrics::{Metrics, Operation, Outcome, Stage};
+//! The TV's own encoding (JPEG by default, PNG when lossless) is returned as is.
+use crate::error::{TvError, outcome};
+use crate::metrics::{Metrics, Operation, Stage};
 use russh::{
     ChannelMsg, client,
     keys::{PublicKey, PublicKeyOrCertificate, agent::client::AgentClient},
@@ -35,6 +37,9 @@ const CAPTURE: &str = r#"umask 077
 pub struct CaptureConfig {
     pub endpoint: SocketAddr,
     pub username: String,
+    /// Preferred SSH agent socket or pipe. Empty means the `SSH_AUTH_SOCK` of
+    /// the server's environment, which is also the fallback when this path no
+    /// longer accepts connections.
     pub agent_socket: String,
     pub public_key: String,
 }
@@ -59,7 +64,9 @@ impl client::Handler for HostVerifier {
 }
 pub struct CaptureSession(client::Handle<HostVerifier>);
 pub struct CapturedImage {
-    pub png: Vec<u8>,
+    /// The image exactly as the TV encoded it.
+    pub bytes: Vec<u8>,
+    pub mime_type: &'static str,
     pub all_black: bool,
     pub fingerprint: [u8; 32],
     pub width: u32,
@@ -107,7 +114,7 @@ impl CaptureError {
             Self::TransferLimit => {
                 "Capture exceeded the transfer limit; remote cleanup is unconfirmed"
             }
-            Self::InvalidImage => "TV returned an invalid PNG",
+            Self::InvalidImage => "TV returned an invalid image",
             Self::DecodedLimit => "TV image exceeds the decoded size limit",
             Self::CleanupUnconfirmed => {
                 "Capture cleanup is unconfirmed; further capture is blocked"
@@ -138,6 +145,46 @@ impl std::fmt::Display for CaptureError {
     }
 }
 impl std::error::Error for CaptureError {}
+impl From<CaptureError> for TvError {
+    fn from(error: CaptureError) -> Self {
+        match error {
+            CaptureError::Timeout => Self::timeout(error.message()),
+            _ => Self::failure(error.message()),
+        }
+    }
+}
+
+/// Agent endpoints to try in order: the configured one, then the environment's.
+/// Either may be absent; the configured public key still selects the identity.
+fn agent_candidates(configured: &str, environment: Option<String>) -> Vec<String> {
+    let mut candidates = Vec::new();
+    #[cfg(windows)]
+    let fallback = Some(r"\\.\pipe\openssh-ssh-agent".to_owned());
+    #[cfg(not(windows))]
+    let fallback = None;
+    for candidate in [Some(configured.to_owned()), environment, fallback]
+        .into_iter()
+        .flatten()
+    {
+        let candidate = candidate.trim().to_owned();
+        if !candidate.is_empty() && !candidates.contains(&candidate) {
+            candidates.push(candidate);
+        }
+    }
+    candidates
+}
+
+async fn connect_agent<S>(
+    candidates: Vec<String>,
+    connect: impl AsyncFn(String) -> Option<S>,
+) -> Result<S, CaptureError> {
+    for candidate in candidates {
+        if let Some(agent) = connect(candidate).await {
+            return Ok(agent);
+        }
+    }
+    Err(CaptureError::Connection)
+}
 impl CaptureSession {
     pub async fn connect(config: &CaptureConfig) -> Result<Self, &'static str> {
         Self::connect_trusted(config)
@@ -166,14 +213,18 @@ impl CaptureSession {
         .map_err(|_| CaptureError::Connection)?
         .map_err(|_| CaptureError::Connection)?;
         let authenticate = async {
+            let candidates =
+                agent_candidates(&config.agent_socket, std::env::var("SSH_AUTH_SOCK").ok());
             #[cfg(unix)]
-            let mut agent = AgentClient::connect_uds(&config.agent_socket)
-                .await
-                .map_err(|_| CaptureError::Connection)?;
+            let mut agent = connect_agent(candidates, async |path: String| {
+                AgentClient::connect_uds(&path).await.ok()
+            })
+            .await?;
             #[cfg(windows)]
-            let mut agent = AgentClient::connect_named_pipe(&config.agent_socket)
-                .await
-                .map_err(|_| CaptureError::Connection)?;
+            let mut agent = connect_agent(candidates, async |path: String| {
+                AgentClient::connect_named_pipe(&path).await.ok()
+            })
+            .await?;
             let hash = session
                 .best_supported_rsa_hash()
                 .await
@@ -255,7 +306,10 @@ impl CaptureSession {
         })
         .await?;
         capture_stage(metrics, Stage::ImageValidation, deadline, async {
-            decode_image(output)
+            // Decoding is CPU-bound; keep it off the async workers.
+            tokio::task::spawn_blocking(move || decode_image(output))
+                .await
+                .map_err(|_| CaptureError::InvalidImage)?
         })
         .await
     }
@@ -286,11 +340,7 @@ where
     let measurement = metrics.map(|(metrics, operation)| metrics.stage(operation, stage));
     let result = work.await;
     if let Some(measurement) = measurement {
-        measurement.finish(match &result {
-            Ok(_) => Outcome::Success,
-            Err(CaptureError::Timeout) => Outcome::Timeout,
-            Err(_) => Outcome::Failure,
-        });
+        measurement.finish(outcome(&result));
     }
     result
 }
@@ -320,6 +370,54 @@ where
         .await
         .map_err(|_| "SSH cleanup could not be confirmed")?
 }
+/// What the session needs to know about decoded pixels, whatever the encoding.
+struct Pixels<'a> {
+    width: u32,
+    height: u32,
+    color: png::ColorType,
+    depth: png::BitDepth,
+    samples: &'a [u8],
+}
+
+impl Pixels<'_> {
+    fn describe(self, bytes: Vec<u8>, mime_type: &'static str) -> CapturedImage {
+        let bytes_per_sample = match self.depth {
+            png::BitDepth::Sixteen => 2,
+            _ => 1,
+        };
+        let channels = self.color.samples();
+        let color_channels = if channels == 2 || channels == 4 {
+            channels - 1
+        } else {
+            channels
+        };
+        let all_black = self
+            .samples
+            .chunks_exact(channels * bytes_per_sample)
+            .all(|pixel| {
+                pixel[..color_channels * bytes_per_sample]
+                    .iter()
+                    .all(|&component| component == 0)
+            });
+        let mut hash = Sha256::new();
+        hash.update(self.width.to_be_bytes());
+        hash.update(self.height.to_be_bytes());
+        hash.update([self.color as u8, self.depth as u8]);
+        hash.update(self.samples);
+        CapturedImage {
+            bytes,
+            mime_type,
+            all_black,
+            fingerprint: hash.finalize().into(),
+            width: self.width,
+            height: self.height,
+            recovered: false,
+        }
+    }
+}
+
+/// Fully decode the TV's image to prove it is complete, then return the
+/// original bytes with a fingerprint of the decoded pixels.
 fn decode_image(bytes: Vec<u8>) -> Result<CapturedImage, CaptureError> {
     if bytes.starts_with(&[0xff, 0xd8]) {
         return decode_jpeg(bytes);
@@ -340,45 +438,22 @@ fn decode_image(bytes: Vec<u8>) -> Result<CapturedImage, CaptureError> {
         .next_frame(&mut pixels)
         .map_err(|_| CaptureError::InvalidImage)?;
     reader.finish().map_err(|_| CaptureError::InvalidImage)?;
-    let channels = match frame.color_type {
-        png::ColorType::Grayscale => 1,
-        png::ColorType::GrayscaleAlpha => 2,
-        png::ColorType::Rgb => 3,
-        png::ColorType::Rgba => 4,
-        png::ColorType::Indexed => return Err(CaptureError::InvalidImage),
-    };
-    let bytes_per_sample = match frame.bit_depth {
-        png::BitDepth::Eight => 1,
-        png::BitDepth::Sixteen => 2,
-        _ => return Err(CaptureError::InvalidImage),
-    };
-    let color_channels = if channels == 2 || channels == 4 {
-        channels - 1
-    } else {
-        channels
-    };
-    let pixels = &pixels[..frame.buffer_size()];
-    let all_black = pixels
-        .chunks_exact(channels * bytes_per_sample)
-        .all(|pixel| {
-            pixel[..color_channels * bytes_per_sample]
-                .iter()
-                .all(|&component| component == 0)
-        });
-    let mut hash = Sha256::new();
-    hash.update(frame.width.to_be_bytes());
-    hash.update(frame.height.to_be_bytes());
-    hash.update([frame.color_type as u8, frame.bit_depth as u8]);
-    hash.update(pixels);
-    let fingerprint = hash.finalize().into();
-    Ok(CapturedImage {
-        png: bytes,
-        all_black,
-        fingerprint,
+    if frame.color_type == png::ColorType::Indexed
+        || !matches!(
+            frame.bit_depth,
+            png::BitDepth::Eight | png::BitDepth::Sixteen
+        )
+    {
+        return Err(CaptureError::InvalidImage);
+    }
+    let decoded = Pixels {
         width: frame.width,
         height: frame.height,
-        recovered: false,
-    })
+        color: frame.color_type,
+        depth: frame.bit_depth,
+        samples: &pixels[..frame.buffer_size()],
+    };
+    Ok(decoded.describe(bytes, "image/png"))
 }
 
 fn decode_jpeg(bytes: Vec<u8>) -> Result<CapturedImage, CaptureError> {
@@ -387,7 +462,7 @@ fn decode_jpeg(bytes: Vec<u8>) -> Result<CapturedImage, CaptureError> {
     if !bytes.ends_with(&[0xff, 0xd9]) {
         return Err(CaptureError::InvalidImage);
     }
-    let decoder = image::codecs::jpeg::JpegDecoder::new(Cursor::new(bytes))
+    let decoder = image::codecs::jpeg::JpegDecoder::new(Cursor::new(&bytes))
         .map_err(|_| CaptureError::InvalidImage)?;
     let (width, height) = decoder.dimensions();
     let size = usize::try_from(decoder.total_bytes()).map_err(|_| CaptureError::DecodedLimit)?;
@@ -403,20 +478,14 @@ fn decode_jpeg(bytes: Vec<u8>) -> Result<CapturedImage, CaptureError> {
     decoder
         .read_image(&mut pixels)
         .map_err(|_| CaptureError::InvalidImage)?;
-    let mut png = Vec::new();
-    {
-        let mut encoder = png::Encoder::new(&mut png, width, height);
-        encoder.set_color(color);
-        encoder.set_depth(png::BitDepth::Eight);
-        let mut writer = encoder
-            .write_header()
-            .map_err(|_| CaptureError::InvalidImage)?;
-        writer
-            .write_image_data(&pixels)
-            .map_err(|_| CaptureError::InvalidImage)?;
-        writer.finish().map_err(|_| CaptureError::InvalidImage)?;
-    }
-    decode_image(png)
+    let decoded = Pixels {
+        width,
+        height,
+        color,
+        depth: png::BitDepth::Eight,
+        samples: &pixels,
+    };
+    Ok(decoded.describe(bytes, "image/jpeg"))
 }
 
 trait CaptureConnection: Sized {

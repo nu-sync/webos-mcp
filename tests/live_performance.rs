@@ -11,6 +11,8 @@ use serde_json::{Value, json};
 use tokio::process::Command;
 use webos_mcp::metrics::{Metrics, Operation, Outcome};
 
+mod support;
+
 type TestResult<T> = Result<T, Box<dyn std::error::Error>>;
 
 fn save_private(path: &Path, bytes: &[u8]) -> TestResult<()> {
@@ -63,22 +65,12 @@ fn observation(result: &CallToolResult, previous: &str, path: &Path) -> TestResu
         .iter()
         .find_map(|content| content.as_image())
         .ok_or("fresh screenshot missing")?;
-    if image.mime_type != "image/png" {
-        return Err("unexpected screenshot type".into());
-    }
     let bytes = base64::engine::general_purpose::STANDARD.decode(&image.data)?;
-    let mut reader = png::Decoder::new(std::io::Cursor::new(&bytes)).read_info()?;
-    let size = reader.output_buffer_size().ok_or("PNG size unavailable")?;
-    if size > 64 * 1024 * 1024 {
-        return Err("PNG exceeds test decode limit".into());
-    }
-    let mut pixels = vec![0; size];
-    let frame = reader.next_frame(&mut pixels)?;
-    reader.finish()?;
-    if data["width"] != frame.width || data["height"] != frame.height {
+    let (width, height) = support::decoded_dimensions(&image.mime_type, &bytes)?;
+    if data["width"] != width || data["height"] != height {
         return Err("screenshot dimensions disagree with metadata".into());
     }
-    save_private(path, &bytes)?;
+    save_private(&support::evidence_path(path, &image.mime_type), &bytes)?;
     if data["all_black"] != false || data["visual_change"] == "black" {
         return Err("black screenshot saved; benchmark stops without another action".into());
     }

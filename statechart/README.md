@@ -8,6 +8,8 @@ These are proposed models, not proofs of an implementation. Re-run the affected 
 
 A failed connection keepalive moves a fresh or observation-needed session to a stale state where actions are blocked until reconnection. A preflight check runs after a fresh observation and before any action is sent. A failed or cancelled check requires another observation and creates no pending-action marker; an error after the send begins remains unresolved. The preflight itself cannot prove future delivery or settle an earlier uncertain action.
 
+`AcknowledgeDelivery` is the implemented alternative: while disconnected, a person who has looked at the TV may clear the gate through the interactive `acknowledge-delivery` command. It is a decision to accept the risk, not evidence, and the model does not represent a late delivery arriving after it. No MCP tool can take this transition.
+
 No mechanism to provide that evidence has been verified. Do not implement `DeliverySettled` as an unconditional timeout or assume socket closure drains the TV queue. If no reliable proof is available, the session remains blocked. The model abstracts resources and assumes cleanup transitions succeed; it does not prove OS cleanup. The button transport returns after a local WebSocket send, not a TV acknowledgement; the model's `ActionAcknowledged` transition therefore abstracts an assumption about delivery that has not been established. A fresh image shows the captured screen, not whether a previously queued button could arrive later.
 
 The model now includes a durable action marker and a crash transition. It assumes that marker is committed before any action can be sent, that its update is atomic and survives process death, and that acknowledgement justifies clearing it. These assumptions require implementation and transport evidence. The model does not represent shared physical-remote input, model-facing image content, actual time, retries, multiple server processes, or a real transport. No fairness or eventual completion is asserted. Internal keepalive lock arbitration is covered by implementation tests, not this model; a waiting user request checks health and observation identity after the keepalive releases the device.
@@ -44,6 +46,8 @@ sh "$STATECHART_SKILL_DIR/scripts/statechart" statechart/Onboarding.tla \
 python3 statechart/checks/late_delivery.py
 python3 statechart/checks/preflight_pending.py
 ```
+
+After adding `AcknowledgeDelivery`, TLC reached 37 states and 144 steps with every invariant and the deadlock check passing, and both negative controls still found their expected violations.
 
 The negative controls intentionally permit readiness after an unresolved late delivery and mark an action pending before the preflight; each succeeds only when TLC finds the expected invariant violation. The session chart hides repeated crash, shutdown, and disconnect transitions from some intermediate states; those transitions remain in the checked model. `chart.mmd` and `onboarding-chart.mmd` show the full projected graphs; transitions that do not change a displayed state are omitted by the chart generator. The reports summarize the checked models.
 

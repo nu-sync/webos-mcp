@@ -9,6 +9,8 @@ use rmcp::{
 use serde_json::json;
 use tokio::process::Command;
 
+mod support;
+
 type TestResult<T> = Result<T, Box<dyn std::error::Error>>;
 
 fn require_success(result: &CallToolResult, stage: &'static str) -> TestResult<()> {
@@ -39,18 +41,12 @@ fn save_observation(result: &CallToolResult, path: &Path) -> TestResult<String> 
         .iter()
         .find_map(|content| content.as_image())
         .ok_or("observation image missing")?;
-    if image.mime_type != "image/png" {
-        return Err("unexpected observation MIME type".into());
-    }
     let bytes = base64::engine::general_purpose::STANDARD.decode(&image.data)?;
-    let decoder = png::Decoder::new(std::io::Cursor::new(&bytes));
-    let mut reader = decoder.read_info()?;
-    let mut pixels = vec![0; reader.output_buffer_size().ok_or("PNG size unavailable")?];
-    let frame = reader.next_frame(&mut pixels)?;
-    reader.finish()?;
-    if metadata["width"] != frame.width || metadata["height"] != frame.height {
-        return Err("observation dimensions do not match the returned PNG".into());
+    let (width, height) = support::decoded_dimensions(&image.mime_type, &bytes)?;
+    if metadata["width"] != width || metadata["height"] != height {
+        return Err("observation dimensions do not match the returned image".into());
     }
+    let path = &support::evidence_path(path, &image.mime_type);
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
