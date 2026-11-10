@@ -1,75 +1,144 @@
 # webos-mcp
 
-A local Rust MCP server for a paired webOS TV. This is an early implementation: see [verification status](docs/verification.md) for the tested device path and remaining gaps.
+Let an AI agent see and navigate your LG webOS TV.
 
-## Setup
+`webos-mcp` is a small [Model Context Protocol](https://modelcontextprotocol.io) server written in Rust. It runs on your computer, talks to one TV you have paired, and gives an agent two abilities: take a screenshot, and press a remote button. The agent looks at the screen, decides what to do, and looks again.
 
-Run `cargo run -- setup` in a terminal. Enter the TV's IP address from its network settings. No discovery or network scanning is performed. The address, authorization, certificate fingerprint, and optional SSH configuration are stored in the operating system credential store by default.
+> **Status: early.** The full loop has been tested on one rooted TV from macOS. Windows, Linux, and other TV models are unverified. See [verification status](docs/verification.md) for what has and has not been tested.
 
-Setup asks for the TV's SHA-256 TLS certificate fingerprint. Obtain and verify it using a trusted independent channel; do not trust a fingerprint obtained only from the same unauthenticated network connection. For an existing, independently verified SSH connection to a rooted TV, one possible method is to run this on the TV over that connection:
+## Tools
+
+| Tool | Purpose |
+| --- | --- |
+| `tv_connect` | Open a session with the paired TV and report whether screenshots are available. |
+| `tv_observe` | Take a fresh screenshot and return an `observation_id` for the next action. |
+| `tv_press` | Press a remote button: `UP`, `DOWN`, `LEFT`, `RIGHT`, `ENTER`, `BACK`, or `HOME`. |
+| `tv_launch` | Launch an app by its app ID. |
+| `tv_disconnect` | Close the session and confirm cleanup. |
+| `tv_metrics` | Report local timing and outcome counts for the tools above. |
+
+## Requirements
+
+- An LG webOS TV on a network your computer can reach.
+- Rust, to build the server.
+- For screenshots: a rooted TV with SSH already enabled, and its host key already in your `known_hosts`. Without this, `tv_connect` still works but reports that visual capture is unavailable, and actions stay blocked.
+
+`webos-mcp` never roots a TV, enables SSH, installs software, or changes TV settings. It does not scan your network; you give it the TV's address.
+
+## Quick start
+
+**1. Build**
 
 ```sh
-openssl s_client -connect 127.0.0.1:3001 </dev/null 2>/dev/null | openssl x509 -noout -fingerprint -sha256
+cargo build --release
 ```
 
-Confirm the fingerprint through your trusted channel and enter it at the hidden prompt. Approve TV and OS credential-store requests when needed. For rooted SSH capture, provide an existing SSH user, port, agent socket or pipe, and public key file. The TV host key must already be trusted in the user's SSH `known_hosts` for the selected address and port. Setup does not enable SSH or change TV software. Compositor capture may omit video and external inputs.
+**2. Pair with the TV**
 
-Run `webos-mcp use-local-file` to explicitly migrate an existing pairing into an unencrypted local file outside the repository. This avoids Keychain access after migration; local users and backups with access to that file may be able to read the address and pairing key. Unix permissions are restricted to the current user; Windows access-control behavior has not been verified. The original system-store entries remain until explicitly removed.
+```sh
+./target/release/webos-mcp setup
+```
 
-Run `webos-mcp setup --re-pair` to request a new TV authorization and `webos-mcp remove` to remove local TV credentials. Local removal does not revoke TV-side authorization. If action delivery is uncertain, the local safety marker remains in place; no automatic recovery is offered.
+Setup asks for:
 
-## Navigation
+- **The TV's IP address**, from the TV's network settings.
+- **The TV's TLS certificate fingerprint** (SHA-256). Get it through a channel you already trust, not only from the same unauthenticated connection. If you have a verified SSH session on a rooted TV, one way is to run this on the TV:
 
-Build the server with `cargo build --release` and configure the MCP client to launch the resulting `target/release/webos-mcp` binary (`webos-mcp.exe` on Windows) with no arguments. The optimized build substantially reduced local PNG validation time in the tested loop; capture/transfer remained the largest measured stage.
+  ```sh
+  openssl s_client -connect 127.0.0.1:3001 </dev/null 2>/dev/null | openssl x509 -noout -fingerprint -sha256
+  ```
 
-By default the TV captures JPEG for speed; the server validates it and returns a PNG containing the decoded, lossy pixels. To capture losslessly, set `WEBOS_MCP_LOSSLESS=1` in the MCP server's environment before starting it. If the TV explicitly rejects JPEG as an unsupported format, the server falls back to native PNG. A screenshot may still omit protected video or external inputs.
+- **Optional SSH details for screenshots**: user, port, agent socket or pipe, and public key file.
 
-Start the server without arguments from an MCP client using stdio. Keep one server process and TV session open while navigating:
+Approve the pairing prompt on the TV. Credentials are saved in your operating system's credential store.
+
+**3. Add it to your MCP client**
+
+Point the client at the release binary, with no arguments. It speaks MCP over stdio.
+
+```json
+{
+  "mcpServers": {
+    "webos": { "command": "/path/to/webos-mcp/target/release/webos-mcp" }
+  }
+}
+```
+
+On Windows the binary is `webos-mcp.exe`.
+
+## How an agent uses it
 
 1. Call `tv_connect`, then `tv_observe`.
-2. Inspect the image and copy its `observation_id` into the next `tv_press` or `tv_launch` call.
-3. Inspect the returned image and use its new ID for the following action.
-4. Call `tv_disconnect` when finished.
+2. Look at the image. Pass its `observation_id` to `tv_press` or `tv_launch`.
+3. The action returns a new screenshot and a new ID. Use that ID for the next action.
+4. Call `tv_disconnect` when done.
 
-For example, pass `{ "button": "RIGHT", "observation_id": "<latest ID>" }` to `tv_press`. Both action tools return a new screenshot by default. An ID is valid only for the latest successful observation in the current session; a stale ID is rejected before sending. Set `observe: false` only when you will call `tv_observe` separately before another action.
+For example, `tv_press` with `{ "button": "RIGHT", "observation_id": "<latest ID>" }`.
 
-Action calls default to a 250 ms wait before capture and a 1000 ms window for starting follow-up captures when the pixels are unchanged. Standalone `tv_observe` defaults to zero for both. Override these with `wait_ms` (0–5000) and `change_timeout_ms` (0–3000). Each observation takes at most four samples. The change window is not an overall operation deadline: an in-flight capture can finish after it. Pixel change, unchanged pixels, or a delay does not prove the UI has settled; `ui_settled` remains `unknown`.
+Keep one server process and one session open while navigating.
 
-An action response separates `delivery` from `observation_error`. `delivery: sent` means the transport completed, not that the TV applied the action. If its screenshot fails, do not repeat the action; request another observation. Unknown delivery blocks further actions, including after reconnection. Capture may replace one failed connection and retry within the same call only when the failure occurred before a remote capture command and closure was confirmed. Unconfirmed cleanup remains visible and blocks unsafe recovery.
+## Safety rules
 
-## Metrics
+A TV is a shared screen, and a repeated button press can do the wrong thing. The server is strict about this:
 
-`tv_metrics` returns local, in-memory operation and stage counts, outcomes, and timing aggregates. It records no screen content, device identifiers, button names, or payloads. Set `WEBOS_MCP_METRICS=0` before starting the server to disable collection. Metrics cover calls that enter a tool handler; malformed JSON or typed parameter rejection before a handler is excluded. These timings do not include the client's or model's work. See [the specification](SPEC.md#local-metrics) for stage coverage and [verification status](docs/verification.md) for measurement limits.
+- **Look before you act.** Every action needs the ID from the latest screenshot. An old ID is rejected before anything is sent.
+- **No automatic retries.** If the server cannot tell whether a button press reached the TV, it blocks further actions, even after reconnecting, rather than risk sending it twice.
+- **Sent is not the same as applied.** `delivery: sent` means the message left your computer. Check the screenshot to see what the TV did.
+- **A failed screenshot never returns an old image.** If the screenshot after an action fails, do not repeat the action; call `tv_observe`.
+- **A new screenshot does not mean the screen has settled.** `ui_settled` is always `unknown`.
 
-## Credential storage
+Screenshots may leave out video, HDMI inputs, and protected content. If your agent uses a remote model, screenshots leave your machine.
 
-The address and key are held in the selected credential store. New interactive setup currently uses the system credential store; the local-file option requires an existing pairing or a trusted structured import. The non-secret action safety marker lives in the user's local application data directory; it contains only the pending or clear state. Older development builds used Keychain for this marker, so the first connection after updating may request one additional access to migrate it. A persistent session avoids repeated Keychain reads during button presses. Setup combines the address and pairing data into one protected entry; an older record is combined at the next successful connection. The OS may still ask to unlock or authorize access, particularly after rebuilding or replacing an executable.
+The full contract, including timing options such as `wait_ms` and `change_timeout_ms`, is in [SPEC.md](SPEC.md#mcp-tools).
 
-## Repeatable checks
+## Configuration
 
-Run `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, and
-`cargo test --all-targets` for checks that do not contact a TV or credential store.
-The lifecycle checks are described in [statechart/README.md](statechart/README.md).
+Set these in the MCP server's environment before it starts.
 
-When the configured TV is awake on a static menu, set `WEBOS_MCP_EVIDENCE_DIR`
-to an existing private directory outside this repository, then deliberately run:
+| Variable | Effect |
+| --- | --- |
+| `WEBOS_MCP_LOSSLESS=1` | Capture lossless PNG. By default the TV captures JPEG for speed and the server returns it as a PNG of the decoded pixels. |
+| `WEBOS_MCP_METRICS=0` | Turn off metrics collection. |
+| `WEBOS_MCP_DIAGNOSTICS=1` | Print connection-stage diagnostics to stderr. |
+
+Metrics stay in memory on your computer. They hold operation names, counts, durations, and outcomes, and never screen content, device identifiers, or button names.
+
+## Managing credentials
+
+| Command | What it does |
+| --- | --- |
+| `webos-mcp setup` | Pair with a TV and save credentials. |
+| `webos-mcp setup --re-pair` | Ask the TV for a new authorization. |
+| `webos-mcp remove` | Delete local credentials. This does not revoke the authorization on the TV. |
+| `webos-mcp use-local-file` | Move an existing pairing into a private, unencrypted local file. |
+
+The local file avoids repeated credential-store prompts, but anyone who can read that file, including backups, can read the TV address and pairing key. On Unix the file is readable only by you; Windows permissions have not been verified. The server never falls back to plaintext on its own.
+
+Your operating system may ask you to unlock or approve credential access, especially after you rebuild the binary.
+
+## Development
+
+These checks contact no TV and no credential store:
 
 ```sh
-cargo test --test live_mcp -- --ignored --nocapture
-cargo test --test live_performance compare_split_and_combined_control_pairs -- --ignored --nocapture
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+cargo test --all-targets
 ```
 
-The first journey presses Home and Left. The comparison sends five alternating
-trials per candidate, each pressing Right then Left. It saves private screenshots
-and measurements; inspect the images to verify focus behavior. These commands
-control the shared TV and stop on uncertainty or capture failure. The comparison
-measures MCP latency without LLM reasoning and does not establish a 2–3× speedup.
+The session lifecycle is also model-checked with TLA+; see [statechart/README.md](statechart/README.md).
 
-A separate CPU-only aggregation check is available without TV access:
+Tests named `tests/live_*.rs` are ignored by default because they contact, and in some cases control, the configured TV. Read a test before running it. Those that save screenshots need `WEBOS_MCP_EVIDENCE_DIR` set to a private directory outside this repository. For example, this one connects, reports connect timings, and disconnects without pressing anything:
 
 ```sh
-cargo test --test live_performance metrics_overhead -- --ignored --nocapture
+cargo test --release --test live_connect_stages -- --ignored --nocapture
 ```
+
+More reading:
+
+- [SPEC.md](SPEC.md): scope, tool contracts, and security boundaries.
+- [docs/verification.md](docs/verification.md): what has been tested, and how.
+- [AGENTS.md](AGENTS.md): guidance for contributors and coding agents.
 
 ## License
 
